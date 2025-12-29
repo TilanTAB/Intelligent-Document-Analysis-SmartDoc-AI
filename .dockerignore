@@ -1,0 +1,57 @@
+# Ignore Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files (keep .env.example)
+.env
+.env.local
+.env.*.local
+
+# Logs (mount as volume in production)
+logs/
+*.log
+
+# ChromaDB data (mount as volume in production)
+chroma_db/
+
+# Document cache (mount as volume in production)
+document_cache/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Git
+.git/
+.gitignore
+
+# Documentation build
+docs/_build/
+
+# Misc
+*.DS_Store
+Thumbs.db
