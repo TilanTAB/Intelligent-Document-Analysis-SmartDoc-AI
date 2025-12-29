@@ -527,23 +527,112 @@ def main():
         gradioContainer.insertBefore(container, gradioContainer.firstChild);
         return 'Animation created';
     }
-    // Timer logic for processing
-    window.processingTimerInterval = null;
-    function startProcessingTimer() {
-        var timerElem = document.getElementById('processing-timer');
-        if (!timerElem) return;
-        var start = Date.now();
-        window.processingTimerInterval = setInterval(function() {
-            var elapsed = (Date.now() - start) / 1000;
-            timerElem.textContent = elapsed.toFixed(1) + 's elapsed';
-        }, 200);
+    (() => {
+  const upload_messages = [
+    "Crunching your documents...",
+    "Warming up the AI...",
+    "Extracting knowledge...",
+    "Scanning for insights...",
+    "Preparing your data...",
+    "Looking for answers...",
+    "Analyzing file structure...",
+    "Reading your files...",
+    "Indexing content...",
+    "Almost ready..."
+  ];
+
+  let intervalId = null;
+  let timerId = null;
+  let startMs = null;
+  let lastMsg = null;
+
+  function pickMsg() {
+    if (upload_messages.length === 0) return "";
+    if (upload_messages.length === 1) return upload_messages[0];
+    let m;
+    do {
+      m = upload_messages[Math.floor(Math.random() * upload_messages.length)];
+    } while (m === lastMsg);
+    lastMsg = m;
+    return m;
+  }
+
+  function getMsgSpan() {
+    const root = document.getElementById("processing-message");
+    if (!root) return null;
+    return root.querySelector("#processing-msg");
+  }
+
+  function getTimerSpan() {
+    const root = document.getElementById("processing-message");
+    if (!root) return null;
+    return root.querySelector("#processing-timer");
+  }
+
+  function setMsg(text) {
+    const span = getMsgSpan();
+    if (!span) return;
+    span.textContent = text;
+  }
+
+  function formatElapsed(startMs) {
+    const s = (Date.now() - startMs) / 1000;
+    return `${s.toFixed(1)}s elapsed`;
+  }
+
+  function startRotationAndTimer() {
+    stopRotationAndTimer();
+    setMsg(pickMsg());
+    startMs = Date.now();
+    intervalId = setInterval(() => setMsg(pickMsg()), 2000);
+    const timerSpan = getTimerSpan();
+    if (timerSpan) {
+      timerSpan.textContent = formatElapsed(startMs);
+      timerId = setInterval(() => {
+        timerSpan.textContent = formatElapsed(startMs);
+      }, 200);
     }
-    function stopProcessingTimer() {
-        if (window.processingTimerInterval) {
-            clearInterval(window.processingTimerInterval);
-            window.processingTimerInterval = null;
-        }
+  }
+
+  function stopRotationAndTimer() {
+    if (intervalId) {
+      clearInterval(intervalId);
+      intervalId = null;
     }
+    if (timerId) {
+      clearInterval(timerId);
+      timerId = null;
+    }
+    const timerSpan = getTimerSpan();
+    if (timerSpan) timerSpan.textContent = "";
+  }
+
+  // Auto start/stop based on visibility of the processing box
+  function watchProcessingBox() {
+    const root = document.getElementById("processing-message");
+    if (!root) {
+      setTimeout(watchProcessingBox, 250);
+      return;
+    }
+    const isVisible = () => root.offsetParent !== null;
+    let prev = isVisible();
+    if (prev) startRotationAndTimer();
+
+    const obs = new MutationObserver(() => {
+      const now = isVisible();
+      if (now && !prev) startRotationAndTimer();
+      if (!now && prev) stopRotationAndTimer();
+      prev = now;
+    });
+
+    obs.observe(root, { attributes: true, attributeFilter: ["style", "class"] });
+  }
+
+  window.smartdocStartRotationAndTimer = startRotationAndTimer;
+  window.smartdocStopRotationAndTimer = stopRotationAndTimer;
+
+  watchProcessingBox();
+})();
     """
 
     with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI", css=css, js=js) as demo:
@@ -564,7 +653,7 @@ def main():
         question = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
         chat = gr.Chatbot(label="Answers", elem_id="chat-history")
         submit_btn = gr.Button("Get Answer", variant="primary")
-        processing_message = gr.HTML("", visible=False)
+        processing_message = gr.HTML("", elem_id="processing-message", visible=False)
         doc_context_display = gr.Markdown("*Submit a question to see which document sections were referenced*", elem_classes="doc-context", visible=False)
         refresh_context_btn = gr.Button("Refresh Sources", variant="secondary", visible=False)
         with gr.Tab("Context"):
@@ -607,7 +696,10 @@ def main():
                 gr.update(interactive=False),
                 gr.update(interactive=False),
                 gr.update(interactive=False),
-                gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">{msg}</div>', visible=True)
+                gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
             )
                
             try:
@@ -681,13 +773,14 @@ def main():
                         if chunk_hash not in seen_hashes:
                             seen_hashes.add(chunk_hash)
                             all_chunks.append(chunk)
+                        # else: skip duplicate chunk
                         chunk_idx += 1
-                        percent = int((chunk_idx / total_chunks) * 100)
-                        elapsed = time.time() - start_time
                         # Rotate status message every 10 seconds
+                        elapsed = time.time() - start_time
                         if chunk_idx == 1 or (elapsed // 10) > ((elapsed-1) // 10):
                             msg = random.choice([m for m in upload_messages if m != last_msg])
                             last_msg = msg
+                        # When yielding progress, always do:
                         yield (
                             chat_history,
                             gr.update(visible=False),
@@ -696,7 +789,10 @@ def main():
                             gr.update(interactive=False),
                             gr.update(interactive=False),
                             gr.update(interactive=False),
-                            gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">{msg} ({percent}% complete, {elapsed:.1f}s elapsed)</div>', visible=True)
+                            gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
                         )
                 # After all chunks, show 100%
                 elapsed = time.time() - start_time
@@ -708,7 +804,10 @@ def main():
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
-                    gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">Analyzing your documents... (100% complete, {elapsed:.1f}s elapsed)</div>', visible=True)
+                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
                 )
                 # Stage 3: Building Retriever
                 elapsed = time.time() - start_time
@@ -723,7 +822,7 @@ def main():
                     gr.update(value=(
                         '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
                         '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
-                        '<span>Finding the most relevant information in your documents...</span>'
+                        '<span id="processing-msg"></span>'
                         '</div>'
                     ), visible=True)
                 )
@@ -738,7 +837,10 @@ def main():
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
-                    gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">Processing: Generating Answer ({elapsed:.1f}s elapsed)</div>', visible=True)
+                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
                 )
                 result = orchestrator.full_pipeline(question=question_text, retriever=retriever)
                 answer = result["draft_answer"]
@@ -752,7 +854,10 @@ def main():
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
-                    gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">Processing: Verifying Answer ({elapsed:.1f}s elapsed)</div>', visible=True)
+                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
                 )
                 verification = result.get("verification_report", "No verification details available.")
                 logger.info(f"Verification (internal):\n{verification}")
@@ -771,7 +876,10 @@ def main():
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
-                    gr.update(value=f'<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">Total time elapsed: {total_elapsed:.1f}s</div>', visible=True)
+                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg"></span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
                 )
                
                 time.sleep(1.5)

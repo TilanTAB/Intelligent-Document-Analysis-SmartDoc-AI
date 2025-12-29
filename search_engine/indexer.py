@@ -11,17 +11,42 @@ from typing import List, Any
 import time
 import hashlib
 import os
+import json
 
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.vectorstores import VectorStoreRetriever
 from configuration.parameters import parameters
 
 logger = logging.getLogger(__name__)
+
+
+def doc_id(doc) -> str:
+    src = doc.metadata.get("source", "")
+    page = doc.metadata.get("page", "")
+    chunk = doc.metadata.get("chunk_id", "")
+    base = f"{src}::{page}::{chunk}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def content_hash(doc) -> str:
+    return hashlib.sha256(doc.page_content.encode("utf-8")).hexdigest()
+
+
+def load_manifest(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_manifest(path, manifest):
+    with open(path, "w") as f:
+        json.dump(manifest, f)
 
 
 class EnsembleRetriever(BaseRetriever):
@@ -120,38 +145,55 @@ class RetrieverBuilder:
         logger.info(f"Building hybrid retriever with {len(docs)} documents...")
         if not docs:
             raise ValueError("No documents provided")
-        docset_hash = self._hash_docs(docs)
         chroma_dir = parameters.CHROMA_DB_PATH
-        hash_file = os.path.join(chroma_dir, "docset_hash.txt")
-        # Check if persisted vector store matches current docs
-        if os.path.exists(chroma_dir) and os.path.exists(hash_file):
-            with open(hash_file, "r") as f:
-                persisted_hash = f.read().strip()
-            if persisted_hash == docset_hash:
-                logger.info("Loading Chroma vector store from disk (docs unchanged).")
-                vector_store = Chroma(
-                    embedding_function=self.embeddings,
-                    persist_directory=chroma_dir,
-                )
-            else:
-                logger.info("Docs changed, rebuilding Chroma vector store.")
-                vector_store = Chroma.from_documents(
-                    documents=docs,
-                    embedding=self.embeddings,
-                    persist_directory=chroma_dir,
-                )
-                with open(hash_file, "w") as f:
-                    f.write(docset_hash)
-        else:
-            logger.info("No persisted Chroma vector store found, creating new one.")
-            os.makedirs(chroma_dir, exist_ok=True)
-            vector_store = Chroma.from_documents(
-                documents=docs,
-                embedding=self.embeddings,
-                persist_directory=chroma_dir,
-            )
-            with open(hash_file, "w") as f:
-                f.write(docset_hash)
+        manifest_path = os.path.join(chroma_dir, "indexed_manifest.json")
+        os.makedirs(chroma_dir, exist_ok=True)
+        manifest = load_manifest(manifest_path)
+        vector_store = Chroma(
+            embedding_function=self.embeddings,
+            persist_directory=chroma_dir,
+        )
+        to_add = []
+        ids_to_add = []
+        to_delete_ids = []
+        current_ids = set()
+        for d in docs:
+            _id = doc_id(d)
+            _hash = content_hash(d)
+            current_ids.add(_id)
+            if _id not in manifest:
+                to_add.append(d)
+                ids_to_add.append(_id)
+                manifest[_id] = _hash
+            elif manifest[_id] != _hash:
+                to_delete_ids.append(_id)
+                to_add.append(d)
+                ids_to_add.append(_id)
+                manifest[_id] = _hash             
+        if to_add:
+            # Safety net: de-dupe before add_documents
+            seen = set()
+            uniq_docs, uniq_ids = [], []
+            for doc, _id in zip(to_add, ids_to_add):
+                if _id in seen:
+                    continue
+                seen.add(_id)
+                uniq_docs.append(doc)
+                uniq_ids.append(_id)
+            # Debugging: show duplicate IDs and their sources
+            from collections import Counter
+            counts = Counter(ids_to_add)
+            dupes = [i for i, c in counts.items() if c > 1]
+            if dupes:
+                print("Duplicate IDs:", len(dupes))
+                for d in dupes[:10]:
+                    idxs = [k for k, x in enumerate(ids_to_add) if x == d]
+                    print("ID:", d, "examples:")
+                    for k in idxs[:3]:
+                        md = to_add[k].metadata
+                        print("  ", md.get("source"), md.get("page"), md.get("chunk_index"))
+            vector_store.add_documents(uniq_docs, ids=uniq_ids)
+        save_manifest(manifest_path, manifest)
         # Create BM25 retriever
         t_bm25_start = time.time()
         texts = [doc.page_content for doc in docs]
@@ -183,5 +225,4 @@ class RetrieverBuilder:
         logger.info(f"[PROFILE] Ensemble retriever creation: {t_ensemble_end - t_ensemble_start:.2f}s")
         logger.info(f"Hybrid retriever created (k={parameters.VECTOR_SEARCH_K})")
         logger.info(f"[PROFILE] Total hybrid retriever build: {t_ensemble_end - t_bm25_start:.2f}s")
-        self._retriever_cache[docset_hash] = hybrid_retriever
         return hybrid_retriever
