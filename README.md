@@ -1,14 +1,14 @@
 # SmartDoc AI
 
-SmartDoc AI is an advanced document analysis and question answering system, designed for source-grounded Q&A over complex business and scientific reports—especially where key evidence lives in tables and charts.
+SmartDoc AI is an advanced document analysis and question answering system, designed for source-grounded Q&A over complex business and scientific reportsâ€”especially where key evidence lives in tables and charts.
 
 ---
 
-## ?? Personal Research Update
+## Personal Research Update
 
-**SmartDoc AI – Document Q&A + Selective Chart Understanding**
+**SmartDoc AI â€“ Document Q&A + Selective Chart Understanding**
 
-I’ve been developing SmartDoc AI as a technical experiment to improve question answering over complex business/scientific reports—especially where key evidence lives in tables and charts.
+Iâ€™ve been developing SmartDoc AI as a technical experiment to improve question answering over complex business/scientific reportsâ€”especially where key evidence lives in tables and charts.
 
 ### Technical highlights:
 
@@ -26,7 +26,7 @@ I’ve been developing SmartDoc AI as a technical experiment to improve question a
 
 ---
 
-## ?? Demo Videos
+## Demo Videos
 
 - [SmartDoc AI technical demo #1](https://youtu.be/uVU_sLiJU4w)
 - [SmartDoc AI technical demo #2](https://youtu.be/c8CF7-OaKmQ)
@@ -35,7 +35,7 @@ I’ve been developing SmartDoc AI as a technical experiment to improve question a
 ---
 
 ## Repository
-?? https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI
+ https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI
 
 ---
 
@@ -44,7 +44,7 @@ I’ve been developing SmartDoc AI as a technical experiment to improve question a
 - Source-grounded Q&A for business/research documents
 - Automated extraction and summarization from tables/charts
 
-If you’re interested in architecture tradeoffs (cost, latency, memory limits, retrieval quality), feel free to connect.
+If youâ€™re interested in architecture tradeoffs (cost, latency, memory limits, retrieval quality), feel free to connect.
 
 ---
 
