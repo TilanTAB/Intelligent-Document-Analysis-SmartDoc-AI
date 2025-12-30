@@ -5,6 +5,16 @@ import os
 from .definitions import MAX_FILE_SIZE, MAX_TOTAL_SIZE, ALLOWED_TYPES
 
 
+def _default_chroma_path() -> str:
+    if os.environ.get("SPACE_ID"):  # Hugging Face Spaces
+        return os.environ.get("CHROMA_DB_PATH", "/tmp/chroma_db")
+    return os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+
+
+def _is_hf() -> bool:
+    return os.environ.get("SPACE_ID") is not None
+
+
 class Settings(BaseSettings):
     """
     Application parameters loaded from environment variables.
@@ -35,7 +45,7 @@ class Settings(BaseSettings):
     )
 
     # Database parameters
-    CHROMA_DB_PATH: str = "./chroma_db"
+    CHROMA_DB_PATH: str = Field(default_factory=_default_chroma_path)
 
     # Chunking parameters
     CHUNK_SIZE: int = 2000
@@ -51,18 +61,19 @@ class Settings(BaseSettings):
     CHROMA_COLLECTION_NAME: str = "documents"
 
     # Workflow parameters
-    MAX_RESEARCH_ATTEMPTS: int = 2
+    MAX_RESEARCH_ATTEMPTS: int = 5
     ENABLE_QUERY_REWRITING: bool = True
     MAX_QUERY_REWRITES: int = 1
     RELEVANCE_CHECK_K: int = 20
 
     # Research agent parameters
     RESEARCH_TOP_K: int = 15
-    RESEARCH_MAX_CONTEXT_CHARS: int = 8000000000
+    RESEARCH_MAX_CONTEXT_CHARS: int = Field(default_factory=lambda: 800_000 if _is_hf() else 8000000000)
     RESEARCH_MAX_OUTPUT_TOKENS: int = 500
+    NUM_RESEARCH_CANDIDATES: int = 2  # Number of research questions to generate
 
     # Verification parameters
-    VERIFICATION_MAX_CONTEXT_CHARS: int = 800000000
+    VERIFICATION_MAX_CONTEXT_CHARS: int = Field(default_factory=lambda: 300_000 if _is_hf() else 800000000)
     VERIFICATION_MAX_OUTPUT_TOKENS: int = 300
 
     # Logging parameters
@@ -86,12 +97,12 @@ class Settings(BaseSettings):
     ENABLE_CHART_EXTRACTION: bool = True
     CHART_VISION_MODEL: str = "gemini-2.5-flash-lite"
     CHART_MAX_TOKENS: int = 1500
-    CHART_DPI: int = 150  # Lower DPI saves memory
-    CHART_BATCH_SIZE: int = 3  # Process pages in batches
-    CHART_MAX_IMAGE_SIZE: int = 1920  # Max dimension for images
+    CHART_DPI: int = Field(default_factory=lambda: 110 if _is_hf() else 110)  # Lower DPI saves memory
+    CHART_BATCH_SIZE: int = Field(default_factory=lambda: 1 if _is_hf() else 1)  # Process pages in batches
+    CHART_MAX_IMAGE_SIZE: int = Field(default_factory=lambda: 1200 if _is_hf() else 1200)  # Max dimension for images
 
     # Local chart detection parameters (cost optimization)
-    CHART_USE_LOCAL_DETECTION: bool = True  # Use OpenCV first (FREE)
+    CHART_USE_LOCAL_DETECTION: bool = Field(default_factory=lambda: True if _is_hf() else True)  # Use OpenCV first (FREE)
     CHART_MIN_CONFIDENCE: float = 0.4  # Only analyze charts with confidence > 40%
     CHART_SKIP_GEMINI_DETECTION: bool = True  # Skip Gemini for detection, only use for analysis
     CHART_GEMINI_FALLBACK_ENABLED: bool = False  # Optional: Use Gemini if local fails

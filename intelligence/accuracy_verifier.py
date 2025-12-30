@@ -150,19 +150,38 @@ Provide your verification analysis."""
             feedback_parts.append(f"Additional Details: {verification.additional_details}")
         return " | ".join(feedback_parts) if feedback_parts else None
 
-    def should_retry_research(self, verification: VerificationResult) -> bool:
+    def should_retry_research(self, verification: VerificationResult, verification_report: str = None, feedback: Optional[str] = None) -> bool:
         """Determine if research should be retried."""
+        # Use structured fields first
         if verification.supported == "NO" or verification.relevant == "NO":
             return True
-        
         if verification.confidence == "LOW" and (
             verification.unsupported_claims or verification.contradictions
         ):
             return True
-        
         if verification.supported == "PARTIAL" and verification.contradictions:
             return True
-        
+        # Also check verification_report string for extra signals (legacy/fallback)
+        if verification_report:
+            if "Supported: NO" in verification_report:
+                logger.warning("[Re-Research] Answer not supported; triggering re-research.")
+                return True
+            elif "Relevant: NO" in verification_report:
+                logger.warning("[Re-Research] Answer not relevant; triggering re-research.")
+                return True
+            elif "Confidence: LOW" in verification_report and "Supported: PARTIAL" in verification_report:
+                logger.warning("[Re-Research] Low confidence with partial support; triggering re-research.")
+                return True
+            elif "Completeness: INCOMPLETE" in verification_report:
+                logger.warning("[Re-Research] Answer is incomplete; triggering re-research.")
+                return True
+            elif "Completeness: PARTIAL" in verification_report:
+                logger.warning("[Re-Research] Answer is partially complete; triggering re-research.")
+                return True
+        # Check feedback for contradiction/unsupported
+        if feedback and ("contradiction" in feedback.lower() or "unsupported" in feedback.lower()):
+            logger.warning("[Re-Research] Feedback indicates contradiction/unsupported; triggering re-research.")
+            return True
         return False
 
     def check(self, answer: str, documents: List[Document], question: Optional[str] = None) -> Dict:
@@ -219,7 +238,7 @@ Provide your verification analysis."""
             "verification_report": verification_report,
             "context_used": context,
             "structured_result": verification_result.model_dump(),
-            "should_retry": self.should_retry_research(verification_result),
+            "should_retry": self.should_retry_research(verification_result, verification_report, feedback),
             "feedback": feedback
         }
 
@@ -333,18 +352,17 @@ Select the best answer by providing its index (0-based) and explain your reasoni
             for line in response_text.split('\n'):
                 if ':' not in line:
                     continue
-                    
                 key, value = line.split(':', 1)
                 key = key.strip().lower().replace(' ', '_')
                 value = value.strip().upper()
                 
-                if key == "SUPPORTED":
+                if key == "supported":
                     data["supported"] = "YES" if "YES" in value else ("PARTIAL" if "PARTIAL" in value else "NO")
-                elif key == "CONFIDENCE":
+                elif key == "confidence":
                     data["confidence"] = "HIGH" if "HIGH" in value else ("MEDIUM" if "MEDIUM" in value else "LOW")
-                elif key == "RELEVANT":
+                elif key == "relevant":
                     data["relevant"] = "YES" if "YES" in value else "NO"
-                elif key == "COMPLETENESS":
+                elif key == "completeness":
                     if "COMPLETE" in value and "INCOMPLETE" not in value:
                         data["completeness"] = "COMPLETE"
                     elif "PARTIAL" in value:

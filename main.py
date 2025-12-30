@@ -17,7 +17,7 @@ from content_analyzer.document_parser import DocumentProcessor
 from search_engine.indexer import RetrieverBuilder
 from intelligence.orchestrator import AgentWorkflow
 from configuration import definitions, parameters
-import gradio as gr                                 
+                                 
 
 # Example data for demo
 EXAMPLES = {
@@ -127,9 +127,26 @@ def _find_open_port(start_port: int, max_attempts: int = 20) -> int:
     raise RuntimeError(f"Could not find an open port starting at {start_port}")
 
 
+def _ensure_hfhub_hffolder_compat():
+    """
+    Shim for Gradio <5.7.1 with huggingface_hub >=1.0.
+    """
+    import huggingface_hub
+    if hasattr(huggingface_hub, "HfFolder"):
+        return
+    try:
+        from huggingface_hub.utils import get_token
+    except Exception:
+        return
+    class HfFolder:
+        @staticmethod
+        def get_token():
+            return get_token()
+    huggingface_hub.HfFolder = HfFolder
+
+
 def _setup_gradio_shim():
     """Shim Gradio's JSON schema conversion to tolerate boolean additionalProperties values."""
-    import gradio as gr
     from gradio_client import utils as grc_utils
     _orig_json_schema_to_python_type = grc_utils._json_schema_to_python_type
     def _json_schema_to_python_type_safe(schema, defs=None):
@@ -140,7 +157,8 @@ def _setup_gradio_shim():
 
 
 def main():
-    """Main application entry point."""
+    _ensure_hfhub_hffolder_compat()  # must run before importing gradio
+    import gradio as gr
     _setup_gradio_shim()
     
     logger.info("=" * 60)
@@ -499,36 +517,9 @@ def main():
         margin-bottom: 16px !important;
     }
     """
-    js = """
-    function createGradioAnimation() {
-        var container = document.createElement('div');
-        container.id = 'gradio-animation';
-        container.style.fontSize = '2.4em';
-        container.style.fontWeight = '700';
-        container.style.textAlign = 'center';
-        container.style.marginBottom = '20px';
-        container.style.marginTop = '10px';
-        container.style.color = '#0369a1';
-        container.style.letterSpacing = '-0.02em';
-        var text = '📄 SmartDoc AI';
-        for (var i = 0; i < text.length; i++) {
-            (function(i){
-                setTimeout(function(){
-                    var letter = document.createElement('span');
-                    letter.style.opacity = '0';
-                    letter.style.transition = 'opacity 0.2s ease';
-                    letter.innerText = text[i];
-                    container.appendChild(letter);
-                    setTimeout(function() { letter.style.opacity = '1'; }, 50);
-                }, i * 80);
-            })(i);
-        }
-        var gradioContainer = document.querySelector('.gradio-container');
-        gradioContainer.insertBefore(container, gradioContainer.firstChild);
-        return 'Animation created';
-    }
-    (() => {
-  const upload_messages = [
+    js = r"""
+(() => {
+  const uploadMessages = [
     "Crunching your documents...",
     "Warming up the AI...",
     "Extracting knowledge...",
@@ -541,99 +532,69 @@ def main():
     "Almost ready..."
   ];
 
-  let intervalId = null;
-  let timerId = null;
-  let startMs = null;
+  let msgInterval = null;
+  let timerInterval = null;
+  let startMs = 0;
   let lastMsg = null;
 
-  function pickMsg() {
-    if (upload_messages.length === 0) return "";
-    if (upload_messages.length === 1) return upload_messages[0];
+  // In Gradio re-renders, the element may get replaced; pick the visible one if duplicates ever appear
+  const root = () => {
+    const all = Array.from(document.querySelectorAll("#processing-message"));
+    return all.find(el => el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)) || all[0] || null;
+  };
+
+  const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+
+  const pickMsg = () => {
+    if (uploadMessages.length === 0) return "";
+    if (uploadMessages.length === 1) return uploadMessages[0];
     let m;
-    do {
-      m = upload_messages[Math.floor(Math.random() * upload_messages.length)];
-    } while (m === lastMsg);
+    do { m = uploadMessages[Math.floor(Math.random() * uploadMessages.length)]; }
+    while (m === lastMsg);
     lastMsg = m;
     return m;
-  }
+  };
 
-  function getMsgSpan() {
-    const root = document.getElementById("processing-message");
-    if (!root) return null;
-    return root.querySelector("#processing-msg");
-  }
+  const getMsgSpan = () => root()?.querySelector("#processing-msg");
+  const getTimerSpan = () => root()?.querySelector("#processing-timer");
 
-  function getTimerSpan() {
-    const root = document.getElementById("processing-message");
-    if (!root) return null;
-    return root.querySelector("#processing-timer");
-  }
+  const setMsg = (t) => { const s = getMsgSpan(); if (s) s.textContent = t; };
+  const fmtElapsed = () => `${((Date.now() - startMs) / 1000).toFixed(1)}s elapsed`;
 
-  function setMsg(text) {
-    const span = getMsgSpan();
-    if (!span) return;
-    span.textContent = text;
-  }
-
-  function formatElapsed(startMs) {
-    const s = (Date.now() - startMs) / 1000;
-    return `${s.toFixed(1)}s elapsed`;
-  }
-
-  function startRotationAndTimer() {
-    stopRotationAndTimer();
-    setMsg(pickMsg());
+  const start = () => {
+    if (msgInterval || timerInterval) return;
     startMs = Date.now();
-    intervalId = setInterval(() => setMsg(pickMsg()), 2000);
-    const timerSpan = getTimerSpan();
-    if (timerSpan) {
-      timerSpan.textContent = formatElapsed(startMs);
-      timerId = setInterval(() => {
-        timerSpan.textContent = formatElapsed(startMs);
-      }, 200);
+    setMsg(pickMsg());
+
+    msgInterval = setInterval(() => setMsg(pickMsg()), 2000);
+
+    const t = getTimerSpan();
+    if (t) {
+      t.textContent = fmtElapsed();
+      timerInterval = setInterval(() => { t.textContent = fmtElapsed(); }, 200);
     }
-  }
+  };
 
-  function stopRotationAndTimer() {
-    if (intervalId) {
-      clearInterval(intervalId);
-      intervalId = null;
-    }
-    if (timerId) {
-      clearInterval(timerId);
-      timerId = null;
-    }
-    const timerSpan = getTimerSpan();
-    if (timerSpan) timerSpan.textContent = "";
-  }
+  const stop = () => {
+    if (msgInterval) { clearInterval(msgInterval); msgInterval = null; }
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    const t = getTimerSpan();
+    if (t) t.textContent = "";
+  };
 
-  // Auto start/stop based on visibility of the processing box
-  function watchProcessingBox() {
-    const root = document.getElementById("processing-message");
-    if (!root) {
-      setTimeout(watchProcessingBox, 250);
-      return;
-    }
-    const isVisible = () => root.offsetParent !== null;
-    let prev = isVisible();
-    if (prev) startRotationAndTimer();
+  const tick = () => {
+    const r = root();
+    if (isVisible(r)) start();
+    else stop();
+  };
 
-    const obs = new MutationObserver(() => {
-      const now = isVisible();
-      if (now && !prev) startRotationAndTimer();
-      if (!now && prev) stopRotationAndTimer();
-      prev = now;
-    });
+  const obs = new MutationObserver(tick);
+  obs.observe(document.body, { subtree: true, childList: true, attributes: true });
 
-    obs.observe(root, { attributes: true, attributeFilter: ["style", "class"] });
-  }
-
-  window.smartdocStartRotationAndTimer = startRotationAndTimer;
-  window.smartdocStopRotationAndTimer = stopRotationAndTimer;
-
-  watchProcessingBox();
+  window.addEventListener("load", tick);
+  setInterval(tick, 500);
 })();
-    """
+"""
 
     with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI", css=css, js=js) as demo:
         gr.Markdown("### SmartDoc AI - Document Q&A", elem_classes="app-title")
@@ -668,26 +629,8 @@ def main():
             "session_start": datetime.now().strftime("%Y-%m-%d %H:%M")
         })
 
-        def process_question(question_text, uploaded_files, chat_history):
-            import time
-            import random
-            chat_history = chat_history or []
-            upload_messages = [
-                "Crunching your documents...",
-                "Warming up the AI...",
-                "Extracting knowledge...",
-                "Scanning for insights...",
-                "Preparing your data...",
-                "Looking for answers...",
-                "Analyzing file structure...",
-                "Reading your files...",
-                "Indexing content...",
-                "Almost ready..."
-            ]
-            last_msg = None
-            start_time = time.time()  
-            msg = random.choice([m for m in upload_messages if m != last_msg])
-            last_msg = msg
+        def process_question(question_text, uploaded_files, chat_history):        
+            chat_history = chat_history or []            
             yield (
                 chat_history,
                 gr.update(visible=False),
@@ -701,7 +644,6 @@ def main():
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
             )
-               
             try:
                 if not question_text.strip():
                     chat_history.append({"role": "user", "content": question_text})
@@ -732,42 +674,32 @@ def main():
                     )
                     return
                 # Stage 2: Chunking with per-chunk progress and rotating status
-                all_chunks = []
-                seen_hashes = set()
-                total_chunks = 0
-                chunk_counts = []
-                for file in uploaded_files:
-                    with open(file.name, 'rb') as f:
+                def load_or_process(file):
+                    with open(file.name, "rb") as f:
                         file_content = f.read()
-                        file_hash = processor._generate_hash(file_content)
+                    file_hash = processor._generate_hash(file_content)
                     cache_path = processor.cache_dir / f"{file_hash}.pkl"
                     if processor._is_cache_valid(cache_path):
                         chunks = processor._load_from_cache(cache_path)
-                        if not chunks:
-                            chunks = processor._process_file(file)
-                            processor._save_to_cache(chunks, cache_path)
-                    else:
-                        chunks = processor._process_file(file)
-                        processor._save_to_cache(chunks, cache_path)
-                    chunk_counts.append(len(chunks))
+                        if chunks:
+                            logger.info(f"Using cached chunks for {file.name}")
+                            return chunks
+                    chunks = processor._process_file(file)
+                    processor._save_to_cache(chunks, cache_path)
+                    return chunks
+
+                all_chunks = []
+                seen_hashes = set()
+                chunks_by_file = []
+                total_chunks = 0
+                for file in uploaded_files:
+                    chunks = load_or_process(file)
+                    chunks_by_file.append(chunks)
                     total_chunks += len(chunks)
                 if total_chunks == 0:
                     total_chunks = 1
                 chunk_idx = 0
-                msg = random.choice(upload_messages)
-                for file, file_chunk_count in zip(uploaded_files, chunk_counts):
-                    with open(file.name, 'rb') as f:
-                        file_content = f.read()
-                        file_hash = processor._generate_hash(file_content)
-                    cache_path = processor.cache_dir / f"{file_hash}.pkl"
-                    if processor._is_cache_valid(cache_path):
-                        chunks = processor._load_from_cache(cache_path)
-                        if not chunks:
-                            chunks = processor._process_file(file)
-                            processor._save_to_cache(chunks, cache_path)
-                    else:
-                        chunks = processor._process_file(file)
-                        processor._save_to_cache(chunks, cache_path)
+                for chunks in chunks_by_file:
                     for chunk in chunks:
                         chunk_hash = processor._generate_hash(chunk.page_content.encode())
                         if chunk_hash not in seen_hashes:
@@ -775,12 +707,7 @@ def main():
                             all_chunks.append(chunk)
                         # else: skip duplicate chunk
                         chunk_idx += 1
-                        # Rotate status message every 10 seconds
-                        elapsed = time.time() - start_time
-                        if chunk_idx == 1 or (elapsed // 10) > ((elapsed-1) // 10):
-                            msg = random.choice([m for m in upload_messages if m != last_msg])
-                            last_msg = msg
-                        # When yielding progress, always do:
+                        # yield progress here if needed
                         yield (
                             chat_history,
                             gr.update(visible=False),
@@ -794,8 +721,7 @@ def main():
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
                         )
-                # After all chunks, show 100%
-                elapsed = time.time() - start_time
+                # After all chunks, show 100%                    
                 yield (
                     chat_history,
                     gr.update(visible=False),
@@ -810,7 +736,6 @@ def main():
 </div>''', visible=True)
                 )
                 # Stage 3: Building Retriever
-                elapsed = time.time() - start_time
                 yield (
                     chat_history,
                     gr.update(visible=False),
@@ -828,7 +753,6 @@ def main():
                 )
                 retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
                 # Stage 4: Generating Answer
-                elapsed = time.time() - start_time
                 yield (
                     chat_history,
                     gr.update(visible=False),
@@ -842,10 +766,9 @@ def main():
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
                 )
-                result = orchestrator.full_pipeline(question=question_text, retriever=retriever)
+                result = orchestrator.run_workflow(question=question_text, retriever=retriever)
                 answer = result["draft_answer"]
                 # Stage 5: Verifying Answer
-                elapsed = time.time() - start_time
                 yield (
                     chat_history,
                     gr.update(visible=False),
@@ -864,10 +787,7 @@ def main():
                 # Do not display verification to user, only use internally
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"**Answer:**\n{answer}"})
-
                 session_state.value["last_documents"] = retriever.invoke(question_text)
-                # Final: Show results and make context tab visible
-                total_elapsed = time.time() - start_time
                 yield (
                     chat_history,
                     gr.update(visible=True),  # doc_context_display
@@ -880,9 +800,7 @@ def main():
   <span id="processing-msg"></span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
-                )
-               
-                time.sleep(1.5)
+                )      
                 yield (
                     chat_history,
                     gr.update(visible=True),
@@ -954,10 +872,8 @@ def main():
                     file_info_text += f"{source_file_path} not found\n"
             if not copied_files:
                 return [], "", "Could not load example files"
-            return copied_files, question_text, file_info_text
-
-        # Remove the Load Example button and related logic
-        # Instead, load the example immediately when dropdown changes
+            return copied_files, question_text, file_info_text          
+        
         example_dropdown.change(
             fn=load_example,
             inputs=[example_dropdown],
@@ -967,6 +883,7 @@ def main():
     # HF Spaces sets SPACE_ID environment variable
     is_hf_space = os.environ.get("SPACE_ID") is not None
     
+    demo.queue()
     if is_hf_space:
         # Hugging Face Spaces configuration
         logger.info("Running on Hugging Face Spaces")
@@ -975,10 +892,8 @@ def main():
         # Local development configuration
         configured_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
         server_port = _find_open_port(configured_port)
-        
         logger.info(f"Launching Gradio on port {server_port}")
         logger.info(f"Access the app at: http://127.0.0.1:{server_port}")
-        
         demo.launch(server_name="127.0.0.1", server_port=server_port, share=False)
 
 
