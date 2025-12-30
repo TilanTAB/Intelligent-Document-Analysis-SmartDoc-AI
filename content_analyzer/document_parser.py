@@ -33,7 +33,6 @@ def detect_chart_on_page(args):
     # Downscale image before detection to save memory
     image = preprocess_image(image, max_dim=1000)
     detection_result = LocalChartDetector.detect_charts(image)
-    # Do NOT delete image here; it will be saved in the main process
     return (page_num, image, detection_result)
 
 def analyze_batch(batch_tuple):
@@ -276,7 +275,7 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"Failed to save cache to {cache_path.name}: {e}", exc_info=True)
     
-    def _process_file(self, file, progress_callback=None) -> List[Document]:
+    def _process_file(self, file) -> List[Document]:
         file_ext = Path(file.name).suffix.lower()
         if file_ext not in ALLOWED_TYPES:
             logger.warning(f"Skipping unsupported file type: {file.name}")
@@ -341,23 +340,27 @@ class DocumentProcessor:
                 return []
             all_chunks = []
             total_docs = len(documents)
+            # --- STABLE FILE HASHING ---
+            with open(file.name, 'rb') as f:
+                file_bytes = f.read()
+            file_hash = self._generate_hash(file_bytes)  # Stable hash by file content
+            stable_source = f"{Path(file.name).name}::{file_hash}"
             for i, doc in enumerate(documents):
                 page_chunks = self.splitter.split_text(doc.page_content)
                 total_chunks = len(page_chunks)
                 for j, chunk in enumerate(page_chunks):
+                    chunk_id = f"txt_{file_hash}_{doc.metadata.get('page', i + 1)}_{j}"
                     chunk_doc = Document(
                         page_content=chunk,
                         metadata={
-                            "source": doc.metadata.get("source", file.name),
+                            "source": stable_source,                            
                             "page": doc.metadata.get("page", i + 1),
                             "type": doc.metadata.get("type", "text"),
+                            "chunk_id": chunk_id
                         }
                     )
                     all_chunks.append(chunk_doc)
-                    if progress_callback:
-                        percent = int(100 * ((i + (j + 1) / total_chunks) / total_docs))
-                        step = f"Splitting page {i+1} into chunks"
-                        progress_callback(percent, step)
+                 
             logger.info(f"Processed {file.name}: {len(documents)} page(s) → {len(all_chunks)} chunk(s)")
             return all_chunks
         except ImportError as e:
@@ -373,6 +376,9 @@ class DocumentProcessor:
         PHASE 1: Parallel local chart detection (CPU-bound, uses ProcessPoolExecutor)
         PHASE 2: Parallel Gemini batch analysis (I/O-bound, uses ThreadPoolExecutor)
         """
+        file_bytes = Path(file_path).read_bytes()
+        file_hash = self._generate_hash(file_bytes)
+        stable_source = f"{Path(file_path).name}::{file_hash}"
         def deduplicate_charts_by_title(chart_chunks):
             seen_titles = set()
             unique_chunks = []
@@ -527,18 +533,19 @@ class DocumentProcessor:
                             except Exception as exc:
                                 logger.error(f"Batch {idx} generated an exception: {exc}")
                     # Flatten results and filter out None
+                    chart_index = 0
                     for batch_docs in results:
                         if batch_docs:
-                            chart_documents.extend(batch_docs)
-                
+                            for doc in batch_docs:
+                                doc.metadata["chunk_id"] = f"{file_hash}_{doc.metadata.get('page', 0)}_{chart_index}"
+                                chart_documents.append(doc)
+                                chart_index += 1
                 else:
                     # Sequential processing (batch disabled or single chart)
-                    for page_num, image_path, detection_result in detected_charts:
+                    for chart_index, (page_num, image_path, detection_result) in enumerate(detected_charts):
                         try:
                             img = Image.open(image_path)
-                        
                             extraction_prompt = """Analyze this chart/graph in comprehensive detail:
-                        
                             **Chart Type**: [type]
                             **Title**: [title]
                             **Axes**: [X and Y labels/units]
@@ -548,7 +555,6 @@ class DocumentProcessor:
                             **Key Values**: [max, min, significant]
                             **Context**: [annotations or notes]
                             """
-                            # For sequential analysis:
                             chart_response = self.gemini_client.models.generate_content(
                                 model=parameters.CHART_VISION_MODEL,
                                 contents=[extraction_prompt, img],
@@ -556,34 +562,21 @@ class DocumentProcessor:
                                     max_output_tokens=parameters.CHART_MAX_TOKENS
                                 )
                             )
-                        
                             chart_types_str = ", ".join(detection_result['chart_types']) or "Unknown"
-                        
                             chart_doc = Document(
-                                page_content=f"""### 📊 Chart Analysis (Page {page_num})
-
-**Detection Method**: Hybrid (Local OpenCV + Gemini Sequential)
-**Local Confidence**: {detection_result['confidence']:.0%}
-**Detected Types**: {chart_types_str}
-
----
-
-{chart_response.text}
-""",
+                                page_content=f"""### \U0001F4CA Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + Gemini Sequential)\n**Local Confidence**: {detection_result['confidence']:.0%}\n**Detected Types**: {chart_types_str}\n\n---\n\n{chart_response.text}\n""",
                                 metadata={
                                     "source": file_path,
                                     "page": page_num,
                                     "type": "chart",
-                                    "extraction_method": "hybrid_sequential"
+                                    "extraction_method": "hybrid_sequential",
+                                    "chunk_id": f"{file_hash}_{page_num}_{chart_index}"
                                 }
                             )
-                        
                             chart_documents.append(chart_doc)
                             stats['charts_analyzed_gemini'] += 1
-                        
                             img.close()
                             logger.info(f"✅ Analyzed chart on page {page_num}")
-                        
                         except Exception as e:
                             logger.error(f"Failed to analyze page {page_num}: {e}")
                 
@@ -622,7 +615,6 @@ class DocumentProcessor:
                     logger.debug(f"Cleaned up temp directory: {temp_dir}")
                 except Exception as e:
                     logger.warning(f"Failed to clean temp directory {temp_dir}: {e}")
-            
         except ImportError as e:
             logger.warning(f"Dependencies missing for chart extraction: {e}")
             return []
@@ -642,6 +634,9 @@ class DocumentProcessor:
         import pdfplumber
         
         logger.info(f"[PDFPLUMBER] Processing: {file_path}")
+        file_bytes = Path(file_path).read_bytes()
+        file_hash = self._generate_hash(file_bytes)
+        stable_source = f"{Path(file_path).name}::{file_hash}"
         
         # Strategy 1: Line-based (default) - for tables with visible borders
         default_parameters = {}
@@ -670,7 +665,6 @@ class DocumentProcessor:
         
         all_content = []
         total_tables = 0
-        
         with pdfplumber.open(file_path) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
                 page_content = [f"## Page {page_num}"]
@@ -742,28 +736,27 @@ class DocumentProcessor:
                         logger.warning(f"Text extraction failed on page {page_num}: {e}")
                     
                     if len(page_content) > 1:
-                        all_content.append("\n\n".join(page_content))
+                        combined = "\n\n".join(page_content)
+                        chunk_id = f"txt_{file_hash}_{page_num}_0"
+                        doc = Document(
+                            page_content=combined,
+                            metadata={
+                                "source": stable_source,                                
+                                "page": page_num,
+                                "loader": "pdfplumber",
+                                "tables_count": total_tables,
+                                "type": "text",
+                                "chunk_id": chunk_id
+                            }
+                        )
+                        all_content.append(doc)
                 except Exception as e:
                     logger.warning(f"Skipping page {page_num} due to error: {e}")
                     continue
         
-        combined_content = "\n\n".join(all_content)
-        
-        logger.info(f"[PDFPLUMBER] Extracted {len(combined_content)} chars, {total_tables} tables")
-        
-        doc = Document(
-            page_content=combined_content,
-            metadata={
-                "source": file_path,
-                "page": 1,
-                "loader": "pdfplumber",
-                "tables_count": total_tables,
-                "type": "text"
-            }
-        )
-        
-        return [doc]
-
+        logger.info(f"[PDFPLUMBER] Extracted {len(all_content)} chunks, {total_tables} tables")
+        return all_content
+    
     def _table_to_markdown(self, table: List[List], page_num: int, table_idx: int) -> str:
         """Convert a table (list of rows) to markdown format."""
         if not table or len(table) < 1:
@@ -800,43 +793,7 @@ class DocumentProcessor:
         for row in cleaned_table[1:]:
             md_lines.append("| " + " | ".join(row) + " |")
         
-        return "\n".join(md_lines)
-    
-    def process(self, files: List, progress_callback=None) -> List[Document]:
-        """
-        Process multiple files with caching and deduplication.
-        """
-        self.validate_files(files)
-        all_chunks = []
-        seen_hashes = set()
-        logger.info(f"Processing {len(files)} file(s)...")
-        for file in files:
-            try:
-                with open(file.name, 'rb') as f:
-                    file_content = f.read()
-                    file_hash = self._generate_hash(file_content)
-                cache_path = self.cache_dir / f"{file_hash}.pkl"
-                if self._is_cache_valid(cache_path):
-                    chunks = self._load_from_cache(cache_path)
-                    if chunks:
-                        logger.info(f"Using cached chunks for {file.name}")
-                    else:
-                        chunks = self._process_file(file, progress_callback=progress_callback)
-                        self._save_to_cache(chunks, cache_path)
-                else:
-                    logger.info(f"Processing and caching: {file.name}")
-                    chunks = self._process_file(file, progress_callback=progress_callback)
-                    self._save_to_cache(chunks, cache_path)
-                for chunk in chunks:
-                    chunk_hash = self._generate_hash(chunk.page_content.encode())
-                    if chunk_hash not in seen_hashes:
-                        seen_hashes.add(chunk_hash)
-                        all_chunks.append(chunk)
-            except Exception as e:
-                logger.error(f"Failed to process {file.name}: {e}", exc_info=True)
-                continue
-        logger.info(f"Processing complete: {len(all_chunks)} unique chunks from {len(files)} file(s)")
-        return all_chunks
+        return "\n".join(md_lines)                        
 
 def run_pdfplumber(file_name):
     from content_analyzer.document_parser import DocumentProcessor
