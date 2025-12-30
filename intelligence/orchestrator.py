@@ -44,15 +44,10 @@ class AgentState(TypedDict):
 class AgentWorkflow:
     """
     Orchestrates multi-agent orchestrator for document Q&A.
-    
-    Workflow:
-    1. Relevance Check - Determines if documents can answer the question
-    2. Research - Generates multiple answer candidates using document context
-    3. Verification - Selects the best answer from candidates
     """
     
-    MAX_RESEARCH_ATTEMPTS: int = 7
-    NUM_RESEARCH_CANDIDATES: int = 3
+    MAX_RESEARCH_ATTEMPTS: int = parameters.MAX_RESEARCH_ATTEMPTS
+    NUM_RESEARCH_CANDIDATES: int = parameters.NUM_RESEARCH_CANDIDATES
     
     def __init__(self, num_candidates: int = None) -> None:
         """Initialize orchestrator with required agents."""
@@ -173,41 +168,40 @@ Question: {state['question']}
         return {"draft_answer": combined, "verification_report": "Multi-question answer combined."}
     
     def _check_relevance_step(self, state: AgentState) -> Dict[str, Any]:
-        """Check if retrieved documents are relevant to the question."""
         logger.debug("Checking context relevance...")
-        
-        result = self.context_validator.context_validate_with_rewrite(
-            question=state["question"], 
-            retriever=state["retriever"], 
-            k=20,
-            max_rewrites=1
-        )
-        
-        classification = result["classification"]
-        query_used = result["query_used"]
-        was_rewritten = result.get("was_rewritten", False)
-        
-        logger.info(f"Relevance: {classification}")
-        if was_rewritten:
-            logger.debug(f"Query rewritten: {query_used[:60]}...")
 
-        if classification in ["CAN_ANSWER", "PARTIAL"]:
-            if was_rewritten:
-                documents = state["retriever"].invoke(query_used)
-                return {"is_relevant": True, "query_used": query_used, "documents": documents}
-            return {"is_relevant": True, "query_used": state["question"]}
-        else:
+        result = self.context_validator.context_validate_with_rewrite(
+            question=state["question"],
+            retriever=state["retriever"],
+            k=parameters.RELEVANCE_CHECK_K,   # use config instead of hardcoding 20
+            max_rewrites=parameters.MAX_QUERY_REWRITES,
+        )
+
+        classification = result.get("classification", "NO_MATCH")
+        query_used = result.get("query_used", state["question"])
+
+        logger.info(f"Relevance: {classification} (query_used={query_used[:80]})")
+
+        if classification in ("CAN_ANSWER", "PARTIAL"):
+            # ? ALWAYS retrieve docs for the query we’re actually going to answer
+            documents = state["retriever"].invoke(query_used)
             return {
-                "is_relevant": False,
-                "query_used": state["question"],
-                "draft_answer": "This question isn't related to the uploaded documents. Please ask another question."
+                "is_relevant": True,
+                "query_used": query_used,
+                "documents": documents               
             }
+
+        return {
+            "is_relevant": False,
+            "query_used": query_used,               
+            "draft_answer": "This question isn't related to the uploaded documents. Please ask another question.",
+        }
 
     def _decide_after_relevance_check(self, state: AgentState) -> str:
         """Decide next step after relevance check."""
         return "relevant" if state["is_relevant"] else "irrelevant"
     
-    def full_pipeline(self, question: str, retriever: BaseRetriever) -> Dict[str, str]:
+    def run_workflow(self, question: str, retriever: BaseRetriever) -> Dict[str, str]:
         """
         Execute the full Q&A pipeline.
         
@@ -221,15 +215,10 @@ Question: {state['question']}
         try:
             if self.compiled_orchestrator is None:
                 self.compiled_orchestrator = self.build_orchestrator()
-            
-            logger.info(f"Starting pipeline: {question[:80]}...")
-            
-            documents = retriever.invoke(question)
-            logger.info(f"Retrieved {len(documents)} documents")
 
             initial_state: AgentState = {
                 "question": question,
-                "documents": documents,
+                "documents": [],  # Let _check_relevance_step fill this
                 "draft_answer": "",
                 "verification_report": "",
                 "is_relevant": False,
@@ -243,67 +232,24 @@ Question: {state['question']}
                 "sub_queries": [],
                 "sub_answers": []
             }
-            
+
             final_state = self.compiled_orchestrator.invoke(initial_state)
-            
+
             logger.info(f"Pipeline completed (attempts: {final_state.get('research_attempts', 1)})")
-            
+
             return {
                 "draft_answer": final_state["draft_answer"],
                 "verification_report": final_state["verification_report"]
             }
-            
         except Exception as e:
             logger.error(f"Pipeline failed: {e}", exc_info=True)
             raise RuntimeError(f"Workflow execution failed: {e}") from e
-    
-    def _research_step(self, state: AgentState) -> Dict[str, Any]:
-        """Generate multiple answer candidates using the research agent."""
-        attempts = state.get("research_attempts", 0) + 1
-        feedback = state.get("feedback")
-        previous_answer = state.get("draft_answer") if feedback else None
-        # Consolidate contradictions and unsupported claims into feedback
-        contradictions = state.get("contradictions_for_research", [])
-        unsupported_claims = state.get("unsupported_claims_for_research", [])
-        feedback_for_research = state.get("feedback_for_research", feedback)
-        extra_feedback = ""
-        if contradictions:
-            extra_feedback += " Contradictions: " + "; ".join(contradictions) + "."
-        if unsupported_claims:
-            extra_feedback += " Unsupported Claims: " + "; ".join(unsupported_claims) + "."
-        # If feedback_for_research is present, append extra_feedback; otherwise, use extra_feedback only
-        if feedback_for_research:
-            feedback_for_research = feedback_for_research + extra_feedback
-        else:
-            feedback_for_research = extra_feedback.strip()
-        logger.info(f"Research step (attempt {attempts}/{self.MAX_RESEARCH_ATTEMPTS})")
-        logger.info(f"Generating {self.NUM_RESEARCH_CANDIDATES} candidate answers...")
-        candidate_answers = []
-        for i in range(self.NUM_RESEARCH_CANDIDATES):
-            logger.info(f"Generating candidate {i + 1}/{self.NUM_RESEARCH_CANDIDATES}")
-            result = self.researcher.generate(
-                question=state["question"],
-                documents=state["documents"],
-                feedback=feedback_for_research,
-                previous_answer=previous_answer
-            )
-            candidate_answers.append(result["draft_answer"])
-        logger.info(f"Generated {len(candidate_answers)} candidate answers")
-        return {
-            "candidate_answers": candidate_answers,
-            "research_attempts": attempts,
-            "feedback": None
-        }
     
     def _verification_step(self, state: AgentState) -> Dict[str, Any]:
         """Select the best answer from candidates and verify it."""
         logger.debug("Selecting best answer from candidates...")
         
-        candidate_answers = state.get("candidate_answers", [])
-        
-        if not candidate_answers:
-            logger.warning("No candidate answers found, using draft_answer")
-            candidate_answers = [state.get("draft_answer", "")]
+        candidate_answers = state.get("candidate_answers", []) or [state.get("draft_answer", "")]
         
         # Select the best answer from candidates
         selection_result = self.verifier.select_best_answer(
@@ -331,58 +277,45 @@ Question: {state['question']}
                              f"**Selection Confidence:** {selection_result.get('confidence', 'N/A')}\n" + \
                              f"**Selection Reasoning:** {selection_reasoning}\n\n" + \
                              verification_report
-        
+
+        feedback_for_research = verification_result.get("feedback")
+
         return {
             "draft_answer": best_answer,
             "verification_report": verification_report,
-            "feedback": verification_result.get("feedback"),
-            "selection_reasoning": selection_reasoning
+            "feedback_for_research": feedback_for_research,
+            "selection_reasoning": selection_reasoning,
+            "should_retry": verification_result.get("should_retry", False),
         }
     
     def _decide_next_step(self, state: AgentState) -> str:
         """Decide whether to re-research or end orchestrator."""
-        verification_report = state["verification_report"]
         research_attempts = state.get("research_attempts", 1)
-        feedback = state.get("feedback")
-        needs_re_research = False
-        # Extract contradictions and unsupported claims for feedback
-        contradictions = []
-        unsupported_claims = []
-        import re
-        for line in verification_report.splitlines():
-            if line.startswith("**Contradictions:"):
-                contradictions = [c.strip() for c in line.split(":", 1)[-1].split(",") if c.strip() and c.strip().lower() != "none"]
-            if line.startswith("**Unsupported Claims:"):
-                unsupported_claims = [u.strip() for u in line.split(":", 1)[-1].split(",") if u.strip() and u.strip().lower() != "none"]
-        if "Supported: NO" in verification_report:
-            needs_re_research = True
-            logger.warning("[Re-Research] Answer not supported; triggering re-research.")
-        elif "Relevant: NO" in verification_report:
-            needs_re_research = True
-            logger.warning("[Re-Research] Answer not relevant; triggering re-research.")
-        elif "Confidence: LOW" in verification_report and "Supported: PARTIAL" in verification_report:
-            needs_re_research = True
-            logger.warning("[Re-Research] Low confidence with partial support; triggering re-research.")
-        elif "Completeness: INCOMPLETE" in verification_report:
-            needs_re_research = True
-            logger.warning("[Re-Research] Answer is incomplete; triggering re-research.")
-        elif "Completeness: PARTIAL" in verification_report:
-            needs_re_research = True
-            logger.warning("[Re-Research] Answer is partially complete; triggering re-research.")
-        if feedback and not needs_re_research:
-            if "contradiction" in feedback.lower() or "unsupported" in feedback.lower():
-                needs_re_research = True
-                logger.warning("[Re-Research] Feedback indicates contradiction/unsupported; triggering re-research.")
-        # Store extra feedback for research node
-        state["contradictions_for_research"] = contradictions
-        state["unsupported_claims_for_research"] = unsupported_claims
-        state["feedback_for_research"] = feedback
-        if needs_re_research and research_attempts < self.MAX_RESEARCH_ATTEMPTS:
-            logger.info(f"[Re-Research] Re-researching (attempt {research_attempts + 1})")
+        should_retry = bool(state.get("should_retry", False))
+        if should_retry and research_attempts < self.MAX_RESEARCH_ATTEMPTS:
             return "re_research"
-        elif needs_re_research:
-            logger.warning("[Re-Research] Max attempts reached, returning best effort.")
-            return "end"
-        else:
-            logger.info("[Re-Research] Verification passed; ending workflow.")
-            return "end"
+        return "end"
+
+    def _research_step(self, state: AgentState) -> Dict[str, Any]:
+        """Generate multiple answer candidates using the research agent."""
+        attempts = state.get("research_attempts", 0) + 1
+        feedback_for_research = state.get("feedback_for_research")
+        previous_answer = state.get("draft_answer") if feedback_for_research else None
+        logger.info(f"Research step (attempt {attempts}/{self.MAX_RESEARCH_ATTEMPTS})")
+        logger.info(f"Generating {self.NUM_RESEARCH_CANDIDATES} candidate answers...")
+        candidate_answers = []
+        for i in range(self.NUM_RESEARCH_CANDIDATES):
+            logger.info(f"Generating candidate {i + 1}/{self.NUM_RESEARCH_CANDIDATES}")
+            result = self.researcher.generate(
+                question=state["question"],
+                documents=state["documents"],
+                feedback=feedback_for_research,
+                previous_answer=previous_answer
+            )
+            candidate_answers.append(result["draft_answer"])
+        logger.info(f"Generated {len(candidate_answers)} candidate answers")
+        return {
+            "candidate_answers": candidate_answers,
+            "research_attempts": attempts,
+            "feedback": None
+        }

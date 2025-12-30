@@ -74,7 +74,7 @@ class EnsembleRetriever(BaseRetriever):
         *, 
         run_manager: CallbackManagerForRetrieverRun = None
     ) -> List[Document]:
-        """Retrieve and combine documents using weighted RRF, deduplicating charts by content and aggregating page numbers."""
+        """Retrieve and combine documents using weighted RRF, deduplicating charts by doc_id and aggregating page numbers."""
         logger.debug(f"[ENSEMBLE] Query: {query[:80]}...")
         all_docs_with_scores = {}
         retriever_names = ["BM25", "Vector"]
@@ -84,8 +84,8 @@ class EnsembleRetriever(BaseRetriever):
                 docs = retriever.invoke(query)
                 logger.debug(f"[ENSEMBLE] {retriever_name}: {len(docs)} docs (weight: {weight})")
                 for rank, doc in enumerate(docs):
-                    # Deduplicate by content and source only
-                    doc_key = (doc.page_content, doc.metadata.get('source', ''))
+                    # Deduplicate by doc_id only
+                    doc_key = doc_id(doc)
                     rrf_score = weight / (rank + 1 + self.c)
                     if doc_key in all_docs_with_scores:
                         existing_doc, existing_score = all_docs_with_scores[doc_key]
