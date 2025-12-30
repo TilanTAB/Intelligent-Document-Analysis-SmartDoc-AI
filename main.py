@@ -705,6 +705,7 @@ def main():
                         if chunk_hash not in seen_hashes:
                             seen_hashes.add(chunk_hash)
                             all_chunks.append(chunk)
+                        # else: skip duplicate chunk
                         chunk_idx += 1
                         # yield progress here if needed
                         yield (
