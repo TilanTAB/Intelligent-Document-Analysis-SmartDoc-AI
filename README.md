@@ -1,6 +1,50 @@
 # SmartDoc AI
 
-SmartDoc AI is an advanced document analysis and question answering system. It allows you to upload documents, ask questions, and receive accurate, source-verified answers. The system uses a multi-agent workflow, hybrid search, and both local and cloud-based chart detection for high performance and cost efficiency.
+SmartDoc AI is an advanced document analysis and question answering system, designed for source-grounded Q&A over complex business and scientific reports—especially where key evidence lives in tables and charts.
+
+---
+
+## ?? Personal Research Update
+
+**SmartDoc AI – Document Q&A + Selective Chart Understanding**
+
+I’ve been developing SmartDoc AI as a technical experiment to improve question answering over complex business/scientific reports—especially where key evidence lives in tables and charts.
+
+### Technical highlights:
+
+- **Multi-format ingestion:** PDF, DOCX, TXT, Markdown
+- **LLM-assisted query decomposition:** breaks complex prompts into clearer sub-questions for retrieval + answering
+- **Selective chart pipeline (cost-aware):**
+  - Local OpenCV heuristics flag pages that likely contain charts
+  - Gemini Vision is invoked only for chart pages to generate structured chart analysis (reduces unnecessary vision calls)
+- **Table extraction + robust PDF parsing:** pdfplumber strategies for bordered and borderless tables
+- **Parallelized processing:** concurrent PDF parsing + chart detection; batch chart analysis where enabled
+- **Hybrid retrieval:** BM25 + vector search combined via an ensemble retriever
+- **Multi-agent answering:** answer drafting + verification pass, with retrieved context available for inspection (page/source metadata)
+
+**Runtime note:** Large PDFs (many pages/charts) can take minutes depending on DPI, chart volume, and available memory/CPU (HF Spaces limits can be a factor).
+
+---
+
+## ?? Demo Videos
+
+- [SmartDoc AI technical demo #1](https://youtu.be/uVU_sLiJU4w)
+- [SmartDoc AI technical demo #2](https://youtu.be/c8CF7-OaKmQ)
+- [SmartDoc AI technical demo #3](https://youtu.be/P17SZSQJ6Wc)
+
+---
+
+## Repository
+?? https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI
+
+---
+
+## Use Cases
+
+- Source-grounded Q&A for business/research documents
+- Automated extraction and summarization from tables/charts
+
+If you’re interested in architecture tradeoffs (cost, latency, memory limits, retrieval quality), feel free to connect.
 
 ---
 
@@ -27,8 +71,8 @@ SmartDoc AI is an advanced document analysis and question answering system. It a
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/TilanTAB/Intelligent-Document-Analysis-Q-A-3.git
-cd Intelligent-Document-Analysis-Q-A-3
+git clone https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI.git
+cd Intelligent-Document-Analysis-SmartDoc-AI
 ```
 
 2. Activate the virtual environment:
@@ -43,7 +87,7 @@ activate_venv.bat
 
 3. Install dependencies (if needed):
 ```bash
-pip install -r dependencies.txt
+pip install -r requirements.txt
 ```
 
 4. Configure environment variables:
@@ -114,4 +158,4 @@ This project is licensed under the MIT License.
 
 ---
 
-SmartDoc AI is actively maintained and designed for real-world document analysis and Q&A. For updates and support, visit the [GitHub repository](https://github.com/TilanTAB/Intelligent-Document-Analysis-Q-A-3).
+SmartDoc AI is actively maintained and designed for real-world document analysis and Q&A. For updates and support, visit the [GitHub repository](https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI).
