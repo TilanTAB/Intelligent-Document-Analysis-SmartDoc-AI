@@ -52,7 +52,21 @@ class LocalChartDetector:
             else:
                 image_cv = image
             height, width = image_cv.shape[:2]
+
+            # Always downscale for detection (even if caller forgot)
+            MAX_DETECT_DIM = 900
+            if max(height, width) > MAX_DETECT_DIM:
+                scale = MAX_DETECT_DIM / max(height, width)
+                image_cv = cv2.resize(image_cv, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+                height, width = image_cv.shape[:2]
+
             gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+
+            # Optional: reduce OpenCV internal thread usage (helps in HF containers)
+            try:
+                cv2.setNumThreads(1)
+            except Exception:
+                pass
 
             # --- Edge Detection ---
             edges = cv2.Canny(gray, 50, 150)
@@ -74,23 +88,24 @@ class LocalChartDetector:
                 edges,
                 rho=1,
                 theta=np.pi/180,
-                threshold=100,
+                threshold=120,  # slightly higher reduces line explosion
                 minLineLength=100,
                 maxLineGap=10
             )
             line_count = len(lines) if lines is not None else 0
-            diagonal_lines = 0
-            line_angles = []
+            diag_lines_raw = 0
+            raw_angles = []
             if lines is not None:
                 for line in lines:
                     x1, y1, x2, y2 = line[0]
                     angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
                     if 10 < angle < 80 or 100 < angle < 170:
-                        diagonal_lines += 1
-                        line_angles.append(angle)
+                        diag_lines_raw += 1
+                        raw_angles.append(angle)
+
+            run_circles = diag_lines_raw >= 1 or line_count >= 6
 
             # --- Circle Detection (Optimized) ---
-            run_circles = diagonal_lines >= 1 or line_count >= 6 or overall_edge_density > 0.08
             circle_count = 0
             circles = None
             if run_circles:
@@ -110,12 +125,13 @@ class LocalChartDetector:
                     circle_count = circles.shape[2]
 
             # --- Color Diversity Analysis ---
-            hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
+            small_for_hist = cv2.resize(image_cv, (256, 256), interpolation=cv2.INTER_AREA)
+            hsv = cv2.cvtColor(small_for_hist, cv2.COLOR_BGR2HSV)
             hist = cv2.calcHist([hsv], [0], None, [180], [0, 180])
-            color_peaks = np.sum(hist > np.mean(hist) * 2)
+            color_peaks = int(np.sum(hist > (np.mean(hist) * 2)))
 
             # --- Contour Detection ---
-            contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             significant_contours = 0
             rectangle_contours = 0
             similar_rectangles = []
@@ -148,16 +164,16 @@ class LocalChartDetector:
                 if (width_std < avg_width * 0.3 or height_std < avg_height * 0.3):
                     bar_pattern = True
 
-            # --- Line Classification ---
+            # --- Line Classification (filtered) ---
             horizontal_lines = 0
             vertical_lines = 0
-            diagonal_lines = 0
+            diag_lines_filtered = 0
             line_angles = []
             very_short_lines = 0
             if lines is not None:
                 for line in lines:
                     x1, y1, x2, y2 = line[0]
-                    length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                    length = np.hypot(x2 - x1, y2 - y1)
                     if length < 50:
                         very_short_lines += 1
                         continue
@@ -170,11 +186,11 @@ class LocalChartDetector:
                     elif 80 < angle < 100:
                         vertical_lines += 1
                     else:
-                        diagonal_lines += 1
-            angle_variance = np.var(line_angles) if len(line_angles) > 2 else 0
+                        diag_lines_filtered += 1
+            angle_variance = float(np.var(line_angles)) if len(line_angles) > 2 else 0.0
 
             # --- Debug Logging ---
-            logger.debug(f"Chart detection features: lines={line_count}, diagonal_lines={diagonal_lines}, circles={circle_count}, horizontal_lines={horizontal_lines}, vertical_lines={vertical_lines}, color_peaks={color_peaks}, angle_variance={angle_variance}")
+            logger.debug(f"Chart detection features: lines={line_count}, diag_lines_raw={diag_lines_raw}, diag_lines_filtered={diag_lines_filtered}, circles={circle_count}, horizontal_lines={horizontal_lines}, vertical_lines={vertical_lines}, color_peaks={color_peaks}, angle_variance={angle_variance}")
 
             # --- Chart Heuristics and Classification ---
             chart_types = []
@@ -183,16 +199,16 @@ class LocalChartDetector:
             rejection_reason = ""
 
             # Negative checks (text slides, decorative backgrounds, tables)
-            if has_text_region and circle_count < 2 and diagonal_lines < 2 and not bar_pattern:
+            if has_text_region and circle_count < 2 and diag_lines_filtered < 2 and not bar_pattern:
                 if small_scattered_contours > 100 or very_short_lines > 50:
                     rejection_reason = f"Text slide with decorative background (overall density: {overall_edge_density:.2%})"
                     logger.debug(f"Rejected: {rejection_reason}")
                     return _chart_result(False, 0.0, [], rejection_reason, line_count, circle_count, overall_edge_density)
-            if very_short_lines > 50 and circle_count < 2 and diagonal_lines < 3 and line_count < 10:
+            if very_short_lines > 50 and circle_count < 2 and diag_lines_filtered < 3 and line_count < 10:
                 rejection_reason = f"Decorative network background ({very_short_lines} tiny lines, no data elements)"
                 logger.debug(f"Rejected: {rejection_reason}")
                 return _chart_result(False, 0.0, [], rejection_reason, line_count, circle_count, overall_edge_density)
-            if horizontal_lines > 12 and vertical_lines > 12 and circle_count == 0 and diagonal_lines < 2:
+            if horizontal_lines > 12 and vertical_lines > 12 and circle_count == 0 and diag_lines_filtered < 2:
                 grid_lines = horizontal_lines + vertical_lines
                 total_lines = line_count
                 grid_ratio = grid_lines / max(total_lines, 1)
@@ -204,15 +220,15 @@ class LocalChartDetector:
             # Positive chart heuristics (bubble, scatter, line, pie, bar, complex)
             # RELAXED: Detect as line chart if 2+ diagonal lines and angle variance > 40, or 1+ diagonal line and 1+ axis
             if (
-                (diagonal_lines >= 2 and angle_variance > 40) or
-                (diagonal_lines >= 1 and (horizontal_lines >= 1 or vertical_lines >= 1))
+                (diag_lines_filtered >= 2 and angle_variance > 40) or
+                (diag_lines_filtered >= 1 and (horizontal_lines >= 1 or vertical_lines >= 1))
             ):
                 chart_types.append("line_chart")
-                confidence = max(confidence, min(0.88, 0.6 + (diagonal_lines / 40)))
+                confidence = max(confidence, min(0.88, 0.6 + (diag_lines_filtered / 40)))
                 if (horizontal_lines >= 1 or vertical_lines >= 1):
                     confidence = min(0.95, confidence + 0.08)
                 if not description:
-                    description = f"Line chart: {diagonal_lines} diagonal lines, axes: {horizontal_lines+vertical_lines}, variance: {angle_variance:.0f}"
+                    description = f"Line chart: {diag_lines_filtered} diagonal lines, axes: {horizontal_lines+vertical_lines}, variance: {angle_variance:.0f}"
             if circle_count >= 5:
                 chart_types.append("bubble_chart")
                 confidence = min(0.92, 0.70 + (min(circle_count, 20) * 0.01))
@@ -224,7 +240,7 @@ class LocalChartDetector:
                     confidence = min(0.97, confidence + 0.05)
                     chart_types.append("zone_diagram")
                     description += f", {large_contours} colored regions"
-            elif circle_count >= 3 and diagonal_lines > 2:
+            elif circle_count >= 3 and diag_lines_filtered > 2:
                 chart_types.append("scatter_plot")
                 confidence = max(confidence, 0.75)
                 description = f"Scatter plot: {circle_count} data points"
@@ -245,7 +261,7 @@ class LocalChartDetector:
                 if not description:
                     description = "Complex visualization with zones and data points"
             has_moderate_axes = (1 <= horizontal_lines <= 6 or 1 <= vertical_lines <= 6)
-            has_real_data = (circle_count >= 3 or diagonal_lines >= 2 or bar_pattern)
+            has_real_data = (circle_count >= 3 or diag_lines_filtered >= 2 or bar_pattern)
             if has_moderate_axes and has_real_data and confidence > 0.3:
                 confidence = min(0.90, confidence + 0.10)
                 if not description:
@@ -253,8 +269,8 @@ class LocalChartDetector:
 
             # Final chart determination
             strong_indicator = (
-                (diagonal_lines >= 2 and angle_variance > 40) or
-                (diagonal_lines >= 1 and (horizontal_lines >= 1 or vertical_lines >= 1)) or
+                (diag_lines_filtered >= 2 and angle_variance > 40) or
+                (diag_lines_filtered >= 1 and (horizontal_lines >= 1 or vertical_lines >= 1)) or
                 circle_count >= 5 or
                 (circle_count >= 3 and large_contours >= 2) or
                 bar_pattern or
@@ -267,7 +283,7 @@ class LocalChartDetector:
             )
             total_time = time.time() - start_time
             if has_chart:
-                logger.info(f"?? OpenCV detection: {total_time*1000:.0f}ms (lines:{line_count}, diagonal_lines:{diagonal_lines}, circles:{circle_count}, axes:{horizontal_lines+vertical_lines}, angle_variance:{angle_variance})")
+                logger.info(f"?? OpenCV detection: {total_time*1000:.0f}ms (lines:{line_count}, diag_lines_filtered:{diag_lines_filtered}, circles:{circle_count}, axes:{horizontal_lines+vertical_lines}, angle_variance:{angle_variance})")
             else:
                 logger.debug(f"?? OpenCV detection: {total_time*1000:.0f}ms (rejected)")
             return {
@@ -277,7 +293,8 @@ class LocalChartDetector:
                 'description': description or "Potential chart detected",
                 'features': {
                     'lines': line_count,
-                    'diagonal_lines': diagonal_lines,
+                    'diagonal_lines_raw': diag_lines_raw,
+                    'diagonal_lines_filtered': diag_lines_filtered,
                     'circles': circle_count,
                     'contours': significant_contours,
                     'rectangles': rectangle_contours,
