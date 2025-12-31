@@ -30,7 +30,7 @@ I’ve been developing SmartDoc AI as a technical experiment to improve question
 
 - [SmartDoc AI technical demo #1](https://youtu.be/uVU_sLiJU4w)
 - [SmartDoc AI technical demo #2](https://youtu.be/c8CF7-OaKmQ)
-- [SmartDoc AI technical demo #3](https://youtu.be/P17SZSQJ6Wc)
+- [SmartDoc AI technical demo #3](https://youtu.be/Rg3EGEtbH1E)
 
 ---
 
