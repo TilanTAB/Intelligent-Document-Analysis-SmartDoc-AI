@@ -517,84 +517,90 @@ def main():
         margin-bottom: 16px !important;
     }
     """
-    js = r"""
-(() => {
-  const uploadMessages = [
-    "Crunching your documents...",
-    "Warming up the AI...",
-    "Extracting knowledge...",
-    "Scanning for insights...",
-    "Preparing your data...",
-    "Looking for answers...",
-    "Analyzing file structure...",
-    "Reading your files...",
-    "Indexing content...",
-    "Almost ready..."
-  ];
+    js = r'''
+const uploadMessages = [
+  "Crunching your documents...",
+  "Warming up the AI...",
+  "Extracting knowledge...",
+  "Scanning for insights...",
+  "Preparing your data...",
+  "Looking for answers...",
+  "Analyzing file structure...",
+  "Reading your files...",
+  "Indexing content...",
+  "Almost ready..."
+];
 
-  let msgInterval = null;
-  let timerInterval = null;
-  let startMs = 0;
-  let lastMsg = null;
+let msgInterval = null;
+let timerInterval = null;
+let startMs = 0;
+let lastMsg = null;
 
-  // In Gradio re-renders, the element may get replaced; pick the visible one if duplicates ever appear
-  const root = () => {
-    const all = Array.from(document.querySelectorAll("#processing-message"));
-    return all.find(el => el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)) || all[0] || null;
-  };
+function root() {
+  return document.getElementById("processing-message");
+}
+function isVisible(el) {
+  return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+}
+function pickMsg() {
+  if (uploadMessages.length === 0) return "";
+  if (uploadMessages.length === 1) return uploadMessages[0];
+  let m;
+  do { m = uploadMessages[Math.floor(Math.random() * uploadMessages.length)]; }
+  while (m === lastMsg);
+  lastMsg = m;
+  return m;
+}
+function getMsgSpan() {
+  const r = root();
+  return r ? r.querySelector("#processing-msg") : null;
+}
+function getTimerSpan() {
+  const r = root();
+  return r ? r.querySelector("#processing-timer") : null;
+}
+function setMsg(t) {
+  const s = getMsgSpan();
+  if (s) s.textContent = t;
+}
+function fmtElapsed() {
+  return ((Date.now() - startMs) / 1000).toFixed(1) + "s elapsed";
+}
 
-  const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+function start() {
+  if (msgInterval || timerInterval) return;
+  startMs = Date.now();
+  setMsg(pickMsg());
 
-  const pickMsg = () => {
-    if (uploadMessages.length === 0) return "";
-    if (uploadMessages.length === 1) return uploadMessages[0];
-    let m;
-    do { m = uploadMessages[Math.floor(Math.random() * uploadMessages.length)]; }
-    while (m === lastMsg);
-    lastMsg = m;
-    return m;
-  };
+  msgInterval = setInterval(() => setMsg(pickMsg()), 2000);
 
-  const getMsgSpan = () => root()?.querySelector("#processing-msg");
-  const getTimerSpan = () => root()?.querySelector("#processing-timer");
+  const t = getTimerSpan();
+  if (t) {
+    t.textContent = fmtElapsed();
+    timerInterval = setInterval(() => { t.textContent = fmtElapsed(); }, 200);
+  }
+}
 
-  const setMsg = (t) => { const s = getMsgSpan(); if (s) s.textContent = t; };
-  const fmtElapsed = () => `${((Date.now() - startMs) / 1000).toFixed(1)}s elapsed`;
+function stop() {
+  if (msgInterval) { clearInterval(msgInterval); msgInterval = null; }
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  const t = getTimerSpan();
+  if (t) t.textContent = "";
+}
 
-  const start = () => {
-    if (msgInterval || timerInterval) return;
-    startMs = Date.now();
-    setMsg(pickMsg());
+function tick() {
+  const r = root();
+  if (isVisible(r)) start();
+  else stop();
+}
 
-    msgInterval = setInterval(() => setMsg(pickMsg()), 2000);
+// Observe rerenders / visibility changes
+const obs = new MutationObserver(tick);
+obs.observe(document.body, { subtree: true, childList: true, attributes: true });
 
-    const t = getTimerSpan();
-    if (t) {
-      t.textContent = fmtElapsed();
-      timerInterval = setInterval(() => { t.textContent = fmtElapsed(); }, 200);
-    }
-  };
-
-  const stop = () => {
-    if (msgInterval) { clearInterval(msgInterval); msgInterval = null; }
-    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-    const t = getTimerSpan();
-    if (t) t.textContent = "";
-  };
-
-  const tick = () => {
-    const r = root();
-    if (isVisible(r)) start();
-    else stop();
-  };
-
-  const obs = new MutationObserver(tick);
-  obs.observe(document.body, { subtree: true, childList: true, attributes: true });
-
-  window.addEventListener("load", tick);
-  setInterval(tick, 500);
-})();
-"""
+window.addEventListener("load", tick);
+setInterval(tick, 500);
+'''
 
     with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI", css=css, js=js) as demo:
         gr.Markdown("### SmartDoc AI - Document Q&A", elem_classes="app-title")
