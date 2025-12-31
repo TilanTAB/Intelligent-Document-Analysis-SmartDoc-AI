@@ -602,7 +602,7 @@ window.addEventListener("load", tick);
 setInterval(tick, 500);
 '''
 
-    with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI", css=css, js=js) as demo:
+    with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI") as demo:
         gr.Markdown("### SmartDoc AI - Document Q&A", elem_classes="app-title")
         gr.Markdown("Upload your documents and ask questions. Answers will appear below, just like a chat.", elem_classes="app-description")
         gr.Markdown("---")
@@ -652,6 +652,7 @@ setInterval(tick, 500);
             )
             try:
                 if not question_text.strip():
+                   
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please enter a question."})
                     yield (
@@ -665,7 +666,8 @@ setInterval(tick, 500);
                         gr.update(value="", visible=False)
                     )
                     return
-                if not uploaded_files:
+                if not uploaded_files:                         
+                  
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please upload at least one document."})
                     yield (
@@ -791,6 +793,7 @@ setInterval(tick, 500);
                 verification = result.get("verification_report", "No verification details available.")
                 logger.info(f"Verification (internal):\n{verification}")
                 # Do not display verification to user, only use internally
+               
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"**Answer:**\n{answer}"})
                 session_state.value["last_documents"] = retriever.invoke(question_text)
@@ -819,6 +822,8 @@ setInterval(tick, 500);
                 )
             except Exception as e:
                 logger.error(f"Processing error: {e}", exc_info=True)
+               
+               
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
                 yield (
@@ -893,7 +898,7 @@ setInterval(tick, 500);
     if is_hf_space:
         # Hugging Face Spaces configuration
         logger.info("Running on Hugging Face Spaces")
-        demo.launch(server_name="0.0.0.0", server_port=7860)
+        demo.launch(server_name="0.0.0.0", server_port=7860, css=css, js=js)
     else:
         # Local development configuration
         configured_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
