@@ -293,18 +293,33 @@ Question: {state['question']}
         feedback_for_research = state.get("feedback_for_research")
         previous_answer = state.get("draft_answer") if feedback_for_research else None
         logger.info(f"Research step (attempt {attempts}/{self.MAX_RESEARCH_ATTEMPTS})")
-        logger.info(f"Generating {self.NUM_RESEARCH_CANDIDATES} candidate answers...")
+        logger.info(f"Generating {self.NUM_RESEARCH_CANDIDATES} candidate answers in parallel...")
+        
+        # Parallel candidate generation for 2× speedup
+        import concurrent.futures
         candidate_answers = []
-        for i in range(self.NUM_RESEARCH_CANDIDATES):
-            logger.info(f"Generating candidate {i + 1}/{self.NUM_RESEARCH_CANDIDATES}")
+        
+        def generate_candidate(index):
+            logger.info(f"Generating candidate {index + 1}/{self.NUM_RESEARCH_CANDIDATES}")
             result = self.researcher.generate(
                 question=state["question"],
                 documents=state["documents"],
                 feedback=feedback_for_research,
                 previous_answer=previous_answer
             )
-            candidate_answers.append(result["draft_answer"])
-        logger.info(f"Generated {len(candidate_answers)} candidate answers")
+            return result["draft_answer"]
+        
+        # Use ThreadPoolExecutor for parallel LLM API calls (I/O-bound)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.NUM_RESEARCH_CANDIDATES) as executor:
+            futures = [executor.submit(generate_candidate, i) for i in range(self.NUM_RESEARCH_CANDIDATES)]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    candidate_answers.append(future.result())
+                except Exception as e:
+                    logger.error(f"Candidate generation failed: {e}")
+                    # Continue with other candidates even if one fails
+        
+        logger.info(f"Generated {len(candidate_answers)} candidate answers in parallel")
         return {
             "candidate_answers": candidate_answers,
             "research_attempts": attempts,

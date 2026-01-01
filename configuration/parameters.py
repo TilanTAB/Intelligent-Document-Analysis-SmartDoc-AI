@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # Retriever parameters
     VECTOR_SEARCH_K: int = 25
-    VECTOR_Search_K_CHROMA: int = 15
+    VECTOR_SEARCH_K_CHROMA: int = 15  # Fixed typo: was VECTOR_Search_K_CHROMA
     VECTOR_FETCH_K: int = 35
     VECTOR_SCORE_THRESHOLD: float = 0.3
     BM25_SEARCH_K: int = 8
