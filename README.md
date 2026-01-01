@@ -132,7 +132,6 @@ All settings can be configured via environment variables or the `.env` file. Key
 - `content_analyzer/` - Document and chart processing
 - `search_engine/` - Hybrid retriever logic
 - `core/` - Utilities and diagnostics
-- `tests/` - Test suite
 - `main.py` - Application entry point
 
 ---
