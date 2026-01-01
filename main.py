@@ -12,12 +12,38 @@ from pathlib import Path
 from datetime import datetime
 import time
 import random
+from collections import defaultdict, deque
+import threading
 
 from content_analyzer.document_parser import DocumentProcessor
 from search_engine.indexer import RetrieverBuilder
 from intelligence.orchestrator import AgentWorkflow
 from configuration import definitions, parameters
-                                 
+                             
+
+# Rate limiting configuration - 3 requests per hour per IP
+WINDOW_S = 3600
+MAX_CALLS = 5
+_calls = defaultdict(deque)  # ip -> timestamps
+_calls_lock = threading.Lock()  # Thread-safe access to rate limit state
+
+def rate_limit(request):
+    """Thread-safe rate limiting per IP address."""
+    ip = getattr(request.client, "host", "unknown")
+    now = time.time()
+
+    with _calls_lock:
+        q = _calls[ip]
+        # Remove expired entries
+        while q and (now - q[0]) > WINDOW_S:
+            q.popleft()
+    
+        if len(q) >= MAX_CALLS:
+            import gradio as gr
+            raise gr.Error(f"Rate limit: {MAX_CALLS} requests per {WINDOW_S//60} minutes. Please wait.")
+    
+        q.append(now)
+
 
 # Example data for demo
 EXAMPLES = {
@@ -40,14 +66,14 @@ def format_chat_history(history: List[Dict]) -> str:
     """Format chat history as markdown for display."""
     if not history:
         return "*No conversation history yet. Ask a question to get started!*"
-    
+
     formatted = []
     for i, entry in enumerate(history, 1):
         timestamp = entry.get("timestamp", "")
         question = entry.get("question", "")
         answer = entry.get("answer", "")
         confidence = entry.get("confidence", "N/A")
-        
+    
         formatted.append(f"""
 ---
 ### 💬 Q{i} ({timestamp})
@@ -57,7 +83,7 @@ def format_chat_history(history: List[Dict]) -> str:
 
 *Confidence: {confidence}*
 """)
-    
+
     return "\n".join(formatted)
 
 
@@ -65,19 +91,19 @@ def format_document_context(documents: List, question: str = "") -> str:
     """Format retrieved documents with annotation highlighting."""
     if not documents:
         return "*No documents retrieved yet.*"
-    
+
     formatted = [f"### 📚 Retrieved Context ({len(documents)} chunks)\n"]
-    
+
     # Extract key terms from question for highlighting
     key_terms = []
     if question:
         stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'what', 'how', 'why', 'when', 'where', 'which'}
         key_terms = [word.lower() for word in question.split() if word.lower() not in stopwords and len(word) > 2]
-    
+
     for i, doc in enumerate(documents[:5], 1):
         content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
         source = doc.metadata.get('source', 'Unknown') if hasattr(doc, 'metadata') else 'Unknown'
-        
+    
         # Truncate long content
         if len(content) > 500:
             content = content[:500] + "..."
@@ -88,7 +114,7 @@ def format_document_context(documents: List, question: str = "") -> str:
             import re
             pattern = re.compile(re.escape(term), re.IGNORECASE)
             highlighted_content = pattern.sub(f"**{term}**", highlighted_content)
-        
+    
         formatted.append(f"""
 <details>
 <summary>📄 Chunk {i} - {os.path.basename(source)}</summary>
@@ -97,10 +123,10 @@ def format_document_context(documents: List, question: str = "") -> str:
 
 </details>
 """)
-    
+
     if len(documents) > 5:
         formatted.append(f"\n*... and {len(documents) - 5} more chunks*")
-    
+
     return "\n".join(formatted)
 
 
@@ -160,16 +186,16 @@ def main():
     _ensure_hfhub_hffolder_compat()  # must run before importing gradio
     import gradio as gr
     _setup_gradio_shim()
-    
+
     logger.info("=" * 60)
     logger.info("Starting SmartDoc AI application...")
     logger.info("=" * 60)
-    
+
     # Initialize components
     processor = DocumentProcessor()
     retriever_indexer = RetrieverBuilder()
     orchestrator = AgentWorkflow()
-    
+
     logger.info("All components initialized successfully")
 
     # CSS styling - Clean, accessible light theme with professional colors
@@ -179,7 +205,7 @@ def main():
         background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%) !important;
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
     }
-    
+
     /* Title styles - Dark text for readability */
     .app-title { 
         font-size: 2.2em !important; 
@@ -200,7 +226,7 @@ def main():
         font-size: 0.95em !important;
         line-height: 1.6 !important;
     }
-    
+
     /* Section headers */
     .section-header {
         color: #1e293b !important;
@@ -209,7 +235,7 @@ def main():
         padding-bottom: 8px !important;
         margin-bottom: 16px !important;
     }
-    
+
     /* Chat history panel - Clean white card with more height */
     .chat-history { 
         min-height: 500px;
@@ -233,7 +259,7 @@ def main():
     .chat-history strong {
         color: #1e293b !important;
     }
-    
+
     /* Document context panel */
     .doc-context { 
         max-height: 380px; 
@@ -260,7 +286,7 @@ def main():
     .doc-context p, .doc-context span {
         color: #475569 !important;
     }
-    
+
     /* Answer box - Success green accent, auto-height */
     .answer-box > div:nth-child(2) { 
         border-left: 4px solid #10b981 !important; 
@@ -291,7 +317,7 @@ def main():
         border-radius: 6px !important;
         overflow-x: auto !important;
     }
-    
+
     /* Verification box - Blue accent */
     .verification-box >  div:nth-child(2) {
         border-left: 4px solid #0ea5e9 !important;
@@ -307,7 +333,7 @@ def main():
     .verification-box strong {
         color: #075985 !important;
     }
-    
+
     /* Stats panel - Professional blue gradient */
     .stats-panel { 
         background: linear-gradient(135deg, #0369a1 0%, #0284c7 50%, #0ea5e9 100%) !important; 
@@ -320,7 +346,7 @@ def main():
     .stats-panel strong {
         color: #ffffff !important;
     }
-    
+
     /* Info panel */
     .info-panel {
         background: #eff6ff !important;
@@ -329,7 +355,7 @@ def main():
         padding: 12px !important;
         color: #1e40af !important;
     }
-    
+
     /* Form elements */
     .gr-input, .gr-textbox textarea {
         background: #ffffff !important;
@@ -341,13 +367,13 @@ def main():
         border-color: #0ea5e9 !important;
         box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1) !important;
     }
-    
+
     /* Labels */
     label {
         color: #374151 !important;
         font-weight: 500 !important;
     }   
-    
+
     /* Dropdown - High contrast with darker background for visibility */
     .gr-dropdown, 
     [data-testid="dropdown"],
@@ -372,7 +398,7 @@ def main():
         background: transparent !important;
         font-weight: 500 !important;
     }
-    
+
     /* Dropdown container and options */
     [data-testid="dropdown"] span, 
     .dropdown-container span,
@@ -380,7 +406,7 @@ def main():
         color: #1e293b !important;
         font-weight: 500 !important;
     }
-    
+
     /* Dropdown list options */
     .gr-dropdown ul, 
     .dropdown-options,
@@ -401,14 +427,14 @@ def main():
         background: #c7d2fe !important;
         color: #1e40af !important;
     }
-    
+
     /* Dropdown label */
     .gr-dropdown label,
     [data-testid="dropdown"] label {
         color: #1e40af !important;
         font-weight: 600 !important;
     }
-    
+
     /* Tabs - Clean styling */
     .tab-nav {
         border-bottom: 2px solid #e2e8f0 !important;
@@ -425,7 +451,7 @@ def main():
         border-bottom: 3px solid #0369a1 !important;
         font-weight: 600 !important;
     }
-    
+
     /* Markdown text */
     .prose, .markdown-text {
         color: #334155 !important;
@@ -437,7 +463,7 @@ def main():
     .prose strong, .markdown-text strong {
         color: #0f172a !important;
     }
-    
+
     /* Scrollbar styling */
     ::-webkit-scrollbar {
         width: 8px;
@@ -469,7 +495,7 @@ def main():
         background: #1d4ed8 !important;
         box-shadow: 0 4px 10px rgba(30, 64, 175, 0.4) !important;
     }         
-    
+
     /* Left side input boxes with borders */
     .left-panel-box {
         background: #fafafa !important;
@@ -482,7 +508,7 @@ def main():
         border-color: #64748b !important;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1) !important;
     }
-    
+
     /* File upload box with border */
     .file-upload-box {
         background: #f8fafc !important;
@@ -495,7 +521,7 @@ def main():
         border-style: solid !important;
         background: #f0f9ff !important;
     }
-    
+
     /* Question input box with border */
     .question-box {
         background: #fffbeb !important;
@@ -602,12 +628,16 @@ window.addEventListener("load", tick);
 setInterval(tick, 500);
 '''
 
-    with gr.Blocks(theme=gr.themes.Soft(), title="SmartDoc AI") as demo:
+    # Launch server - Compatible with both local and Hugging Face Spaces
+    # HF Spaces sets SPACE_ID environment variable
+    is_hf_space = os.environ.get("SPACE_ID") is not None
+
+    with gr.Blocks(title="SmartDoc AI") as demo:
         gr.Markdown("### SmartDoc AI - Document Q&A", elem_classes="app-title")
         gr.Markdown("Upload your documents and ask questions. Answers will appear below, just like a chat.", elem_classes="app-description")
         gr.Markdown("---")
 
-        # Examples dropdown
+        # Examples dropdown - visible for both local and HF Spaces
         example_dropdown = gr.Dropdown(
             label="Quick Start - Choose an Example",
             choices=list(EXAMPLES.keys()),
@@ -635,7 +665,8 @@ setInterval(tick, 500);
             "session_start": datetime.now().strftime("%Y-%m-%d %H:%M")
         })
 
-        def process_question(question_text, uploaded_files, chat_history):        
+        def process_question(question_text, uploaded_files, chat_history, request: gr.Request):
+            rate_limit(request)
             chat_history = chat_history or []            
             yield (
                 chat_history,
@@ -652,7 +683,7 @@ setInterval(tick, 500);
             )
             try:
                 if not question_text.strip():
-                   
+               
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please enter a question."})
                     yield (
@@ -667,7 +698,7 @@ setInterval(tick, 500);
                     )
                     return
                 if not uploaded_files:                         
-                  
+              
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please upload at least one document."})
                     yield (
@@ -793,7 +824,7 @@ setInterval(tick, 500);
                 verification = result.get("verification_report", "No verification details available.")
                 logger.info(f"Verification (internal):\n{verification}")
                 # Do not display verification to user, only use internally
-               
+           
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"**Answer:**\n{answer}"})
                 session_state.value["last_documents"] = retriever.invoke(question_text)
@@ -822,8 +853,8 @@ setInterval(tick, 500);
                 )
             except Exception as e:
                 logger.error(f"Processing error: {e}", exc_info=True)
-               
-               
+           
+           
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
                 yield (
@@ -865,47 +896,259 @@ setInterval(tick, 500);
                 return [], "", "Select a valid example from the dropdown above"
             ex_data = EXAMPLES[example_key]
             question_text = ex_data["question"]
-            file_paths = ex_data["file_paths"]
-            import tempfile
-            temp_dir = tempfile.mkdtemp()
-            copied_files = []
-            file_info_text = f"Loaded: {example_key}\n\n"
-            for source_file_path in file_paths:
-                abs_source = os.path.abspath(source_file_path)
-                if os.path.exists(abs_source):
-                    filename = os.path.basename(abs_source)
-                    temp_file_path = os.path.join(temp_dir, filename)
-                    shutil.copy2(abs_source, temp_file_path)
-                    copied_files.append(temp_file_path)
-                    file_size_mb = os.path.getsize(temp_file_path) / (1024 * 1024)
-                    file_info_text += f"{filename} ({file_size_mb:.2f} MB)\n"
-                else:
-                    file_info_text += f"{source_file_path} not found\n"
-            if not copied_files:
-                return [], "", "Could not load example files"
-            return copied_files, question_text, file_info_text          
+            file_names = ex_data["file_paths"]
         
+            # Try to download from HF dataset if on Spaces
+            if is_hf_space:
+                try:
+                    from datasets import load_dataset
+                    import tempfile
+                    
+                    copied_files = []
+                    file_info_text = f"✅ Loaded: {example_key}\n\n"
+                    
+                    # Get HF token - REQUIRED for gated datasets
+                    hf_token = os.environ.get("HF_TOKEN", None)
+                    
+                    if not hf_token:
+                        logger.warning("HF_TOKEN not set - required for gated datasets")
+                        return [], "", (
+                            "❌ **Authentication Required**\n\n"
+                            "The example dataset is gated and requires authentication.\n\n"
+                            "**To fix:**\n"
+                            "1. Go to Space Settings → Repository secrets\n"
+                            "2. Add secret: `HF_TOKEN` = your Hugging Face token\n"
+                            "3. Restart the Space\n\n"
+                            "Or make your dataset public at:\n"
+                            "https://huggingface.co/datasets/TilanB/smartdoc-samples/settings\n\n"
+                            "For now, please **upload files manually**."
+                        )
+                    
+                    try:
+                        # Load dataset - uses row-based structure
+                        logger.info(f"Loading dataset from HuggingFace: TilanB/smartdoc-samples")
+                        ds = load_dataset(
+                            "TilanB/smartdoc-samples",
+                            split="train",
+                            token=hf_token
+                        )
+                        logger.info(f"Dataset loaded with {len(ds)} rows")
+                        
+                        # Create temp directory for files
+                        temp_dir = tempfile.mkdtemp(prefix='hf_examples_')
+                        
+                        # Debug: Log first row structure
+                        if len(ds) > 0:
+                            first_row = ds[0]
+                            pdf_data = first_row.get('pdf', None)
+                            logger.info(f"Dataset first row 'pdf' type: {type(pdf_data)}")
+                            
+                            # Handle different types
+                            if hasattr(pdf_data, 'stream') and hasattr(pdf_data.stream, 'name'):
+                                # pdfplumber PDF object
+                                logger.info(f"PDF is pdfplumber object, stream path: {pdf_data.stream.name}")
+                            elif isinstance(pdf_data, dict):
+                                logger.info(f"PDF dict keys: {list(pdf_data.keys())}")
+                                if 'path' in pdf_data:
+                                    logger.info(f"PDF path: {pdf_data.get('path', 'N/A')}")
+            
+                        # Extract requested files from dataset rows
+                        for file_path in file_names:
+                            filename = os.path.basename(file_path)
+                            file_found = False
+                            
+                            logger.info(f"Looking for file: {filename}")
+                            
+                            # Search through dataset rows
+                            for row_idx, row in enumerate(ds):
+                                # The 'pdf' column contains file objects from HF datasets
+                                pdf_data = row.get('pdf', None)
+                                
+                                if pdf_data is None:
+                                    continue
+                                
+                                # Extract the actual filename from the pdf data
+                                # HF datasets with PDF files can return different types:
+                                # 1. pdfplumber.pdf.PDF objects (when using pdf feature type)
+                                # 2. dict with 'path' and 'bytes' keys
+                                # 3. str path
+                                # 4. bytes directly
+                                
+                                row_filename = ""
+                                
+                                # Check for pdfplumber PDF object (has .stream.name attribute)
+                                if hasattr(pdf_data, 'stream') and hasattr(pdf_data.stream, 'name'):
+                                    row_filename = pdf_data.stream.name
+                                    logger.debug(f"Got filename from pdfplumber stream: {row_filename}")
+                                # Check for pdfplumber PDF object with path attribute
+                                elif hasattr(pdf_data, 'path'):
+                                    row_filename = pdf_data.path
+                                # Check for dict format
+                                elif isinstance(pdf_data, dict):
+                                    row_filename = pdf_data.get('path', '')
+                                # Check for string path
+                                elif isinstance(pdf_data, str):
+                                    row_filename = pdf_data
+                                
+                                row_basename = os.path.basename(str(row_filename))
+                                logger.debug(f"Row {row_idx}: checking '{row_basename}' vs '{filename}'")
+                                
+                                # Match by filename
+                                if row_basename == filename:
+                                    temp_file_path = os.path.join(temp_dir, filename)
+                                    logger.info(f"Found match! Extracting {filename}...")
+                                    
+                                    try:
+                                        extracted = False
+                                        
+                                        # Handle pdfplumber PDF object
+                                        if hasattr(pdf_data, 'stream'):
+                                            # Get the file path from pdfplumber's stream
+                                            source_path = pdf_data.stream.name
+                                            if source_path and os.path.exists(source_path):
+                                                shutil.copy2(source_path, temp_file_path)
+                                                logger.info(f"Copied from pdfplumber stream: {source_path}")
+                                                extracted = True
+                                            else:
+                                                # Try to read bytes from stream
+                                                try:
+                                                    pdf_data.stream.seek(0)
+                                                    pdf_bytes = pdf_data.stream.read()
+                                                    with open(temp_file_path, 'wb') as f:
+                                                        f.write(pdf_bytes)
+                                                    logger.info(f"Wrote {len(pdf_bytes)} bytes from pdfplumber stream")
+                                                    extracted = True
+                                                except Exception as stream_err:
+                                                    logger.warning(f"Could not read stream: {stream_err}")
+                                        
+                                        # Handle dict format
+                                        elif isinstance(pdf_data, dict):
+                                            if 'bytes' in pdf_data and pdf_data['bytes']:
+                                                with open(temp_file_path, 'wb') as f:
+                                                    f.write(pdf_data['bytes'])
+                                                logger.info(f"Wrote {len(pdf_data['bytes'])} bytes")
+                                                extracted = True
+                                            elif 'path' in pdf_data and pdf_data['path'] and os.path.exists(pdf_data['path']):
+                                                shutil.copy2(pdf_data['path'], temp_file_path)
+                                                logger.info(f"Copied from dict path: {pdf_data['path']}")
+                                                extracted = True
+                                        
+                                        # Handle bytes directly
+                                        elif isinstance(pdf_data, bytes):
+                                            with open(temp_file_path, 'wb') as f:
+                                                f.write(pdf_data)
+                                            extracted = True
+                                        
+                                        # Handle string path
+                                        elif isinstance(pdf_data, str) and os.path.exists(pdf_data):
+                                            shutil.copy2(pdf_data, temp_file_path)
+                                            extracted = True
+                                        
+                                        if extracted and os.path.exists(temp_file_path):
+                                            copied_files.append(temp_file_path)
+                                            file_size_mb = os.path.getsize(temp_file_path) / (1024 * 1024)
+                                            file_info_text += f"📄 {filename} ({file_size_mb:.2f} MB)\n"
+                                            file_found = True
+                                            logger.info(f"✅ Successfully extracted {filename}")
+                                            break
+                                        else:
+                                            logger.error(f"Could not extract file: {type(pdf_data)}")
+                                            
+                                    except Exception as ex:
+                                        logger.error(f"Failed to extract {filename}: {ex}", exc_info=True)
+                                        continue
+                            
+                            if not file_found:
+                                logger.warning(f"❌ File {filename} not found in dataset rows")
+                                # Debug: show what's available
+                                for idx, row in enumerate(ds):
+                                    pdf_data = row.get('pdf', None)
+                                    if pdf_data and hasattr(pdf_data, 'stream') and hasattr(pdf_data.stream, 'name'):
+                                        available_name = os.path.basename(str(pdf_data.stream.name))
+                                        logger.info(f"  Available file in row {idx}: '{available_name}'")
+                                file_info_text += f"⚠️ {filename} - Not found in dataset\n"
+
+                        if not copied_files:
+                            if len(ds) > 0:
+                                logger.error(f"Dataset structure: {list(ds[0].keys())}")
+                            return [], "", f"❌ Could not find example files in dataset.\n\nDataset has {len(ds)} rows. Please upload files manually."
+                        
+                        return copied_files, question_text, file_info_text
+                        
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.error(f"Failed to load dataset: {e}", exc_info=True)
+                        
+                        # Check for gated dataset error
+                        if "gated" in error_msg.lower() or "authenticated" in error_msg.lower():
+                            return [], "", (
+                                "❌ **Dataset Access Denied**\n\n"
+                                "The dataset is gated and your token doesn't have access.\n\n"
+                                "**To fix:**\n"
+                                "1. Visit: https://huggingface.co/datasets/TilanB/smartdoc-samples\n"
+                                "2. Accept the access terms (if any)\n"
+                                "3. Make sure HF_TOKEN is set in Space secrets\n\n"
+                                "Or make your dataset public.\n\n"
+                                "For now, please **upload files manually**."
+                            )
+                        
+                        return [], "", f"❌ Failed to load dataset: {error_msg}\n\nPlease upload files manually."
+                
+                except ImportError as e:
+                    logger.error(f"datasets package not installed: {e}")
+                    return [], "", "❌ 'datasets' package not installed"
+            else:
+                # Local mode - use files from samples directory
+                import tempfile
+                temp_dir = tempfile.mkdtemp()
+                copied_files = []
+                file_info_text = f"Loaded: {example_key}\n\n"
+                for source_file_path in file_names:
+                    abs_source = os.path.abspath(source_file_path)
+                    if os.path.exists(abs_source):
+                        filename = os.path.basename(abs_source)
+                        temp_file_path = os.path.join(temp_dir, filename)
+                        shutil.copy2(abs_source, temp_file_path)
+                        copied_files.append(temp_file_path)
+                        file_size_mb = os.path.getsize(temp_file_path) / (1024 * 1024)
+                        file_info_text += f"{filename} ({file_size_mb:.2f} MB)\n"
+                    else:
+                        file_info_text += f"{source_file_path} not found\n"
+                if not copied_files:
+                    return [], "", "Could not load example files"
+                return copied_files, question_text, file_info_text
+    
         example_dropdown.change(
             fn=load_example,
             inputs=[example_dropdown],
             outputs=[files, question, loaded_file_info]
         )
+    
+        # Show loaded_file_info when example is selected
+        def show_info(example_key):
+            return gr.update(visible=bool(example_key))
+    
+        example_dropdown.change(
+            fn=show_info,
+            inputs=[example_dropdown],
+            outputs=[loaded_file_info]
+        )
     # Launch server - Compatible with both local and Hugging Face Spaces
     # HF Spaces sets SPACE_ID environment variable
     is_hf_space = os.environ.get("SPACE_ID") is not None
-    
+
     demo.queue()
     if is_hf_space:
         # Hugging Face Spaces configuration
         logger.info("Running on Hugging Face Spaces")
-        demo.launch(server_name="0.0.0.0", server_port=7860, css=css, js=js)
+        demo.launch(theme=gr.themes.Soft(), server_name="0.0.0.0", server_port=7860, css=css, js=js)
     else:
         # Local development configuration
         configured_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
         server_port = _find_open_port(configured_port)
         logger.info(f"Launching Gradio on port {server_port}")
         logger.info(f"Access the app at: http://127.0.0.1:{server_port}")
-        demo.launch(server_name="127.0.0.1", server_port=server_port, share=False)
+        demo.launch(theme=gr.themes.Soft(), server_name="127.0.0.1", server_port=server_port, share=False, css=css, js=js)
 
 
 if __name__ == "__main__":
