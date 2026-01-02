@@ -38,6 +38,11 @@ I’ve been developing SmartDoc AI as a technical experiment to improve question
  https://github.com/TilanTAB/Intelligent-Document-Analysis-SmartDoc-AI
 
 ---
+# Hugging Face Link
+
+https://huggingface.co/spaces/TilanB/SmartDocAI
+
+---
 
 ## Use Cases
 
