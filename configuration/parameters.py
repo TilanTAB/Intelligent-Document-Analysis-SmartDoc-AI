@@ -1,7 +1,8 @@
-﻿from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
 from typing import Optional
 import os
+import re
 from .definitions import MAX_FILE_SIZE, MAX_TOTAL_SIZE, ALLOWED_TYPES
 
 
@@ -38,18 +39,76 @@ class Settings(BaseSettings):
     MAX_TOTAL_SIZE: int = MAX_TOTAL_SIZE
     ALLOWED_TYPES: list = ALLOWED_TYPES
 
-    # API keys - REQUIRED, must be set via environment variable or HF Secrets
-    GOOGLE_API_KEY: str = Field(
-        ...,  # Required field
+    # API keys / endpoints - REQUIRED based on provider
+    GOOGLE_API_KEY: Optional[str] = Field(
+        default=None,
         description="Google API key for Gemini models",
+    )
+    OPENAI_API_KEY: Optional[str] = Field(
+        default=None,
+        description="OpenAI API key for GPT models",
+    )
+    AZURE_OPENAI_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Azure OpenAI API key",
+    )
+    AZURE_EMBEDDING_API_KEY: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional separate Azure OpenAI API key for embeddings. "
+            "If unset, AZURE_OPENAI_API_KEY is used."
+        ),
+    )
+    AZURE_OPENAI_ENDPOINT: Optional[str] = Field(
+        default=None,
+        description="Azure OpenAI endpoint URL (e.g., https://YOUR-RESOURCE.openai.azure.com/)",
+    )
+    AZURE_OPENAI_API_VERSION: Optional[str] = Field(
+        default="2024-08-01-preview",
+        description="Azure OpenAI API version",
+    )
+    AZURE_OPENAI_DEPLOYMENT: Optional[str] = Field(
+        default=None,
+        description="Azure OpenAI chat deployment name",
+    )
+    AZURE_EMBEDDING_ENDPOINT: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional separate Azure OpenAI endpoint for embeddings. "
+            "If unset, AZURE_OPENAI_ENDPOINT is used."
+        ),
     )
 
     # Database parameters
     CHROMA_DB_PATH: str = Field(default_factory=_default_chroma_path)
+    CHROMA_COLLECTION_NAME: str = "documents"
+    CHROMA_INGEST_BATCH_SIZE: int = 100
+    CHROMA_HNSW_M: int = 32
+    CHROMA_HNSW_CONSTRUCTION_EF: int = 100
+    CHROMA_HNSW_SEARCH_EF: int = 80
+    CHROMA_HNSW_NUM_THREADS: int = Field(default_factory=lambda: max(1, os.cpu_count() or 1))
+    CHROMA_HNSW_BATCH_SIZE: int = 100
+    CHROMA_HNSW_SYNC_THRESHOLD: int = 1000
+    VECTOR_INGEST_PARALLEL_WORKERS: int = 1
 
     # Chunking parameters
     CHUNK_SIZE: int = 2000
     CHUNK_OVERLAP: int = 100
+    CHUNK_SIZE_TEXT: int = 2000
+    CHUNK_OVERLAP_TEXT: int = 100
+    CHUNK_SIZE_TABLE: int = 1400
+    CHUNK_OVERLAP_TABLE: int = 80
+    CHUNK_SIZE_CHART: int = 2600
+    CHUNK_OVERLAP_CHART: int = 120
+    MAX_INDEX_CHUNKS: int = 2000
+    PRE_INGEST_DEDUPE_ENABLED: bool = True
+    PRE_INGEST_COMPRESS_WHITESPACE: bool = True
+    PRE_INGEST_MIN_CHUNK_CHARS: int = 40
+    # NOTE: fast/auto parser paths were removed; value is kept for backward compatibility.
+    PDF_PARSE_MODE: str = "fidelity"  # accepted: auto | fast | fidelity (all treated as fidelity)
+    # Optional page-range parallelism for single large PDFs (disabled by default).
+    PDF_PARSE_PAGE_RANGE_WORKERS: int = 1
+    PDF_PARSE_PAGE_RANGE_SIZE: int = 24
 
     # Retriever parameters
     VECTOR_SEARCH_K: int = 25
@@ -58,7 +117,6 @@ class Settings(BaseSettings):
     VECTOR_SCORE_THRESHOLD: float = 0.3
     BM25_SEARCH_K: int = 8
     HYBRID_RETRIEVER_WEIGHTS: list = [0.4, 0.6]  # [BM25 weight, Vector weight]
-    CHROMA_COLLECTION_NAME: str = "documents"
 
     # Workflow parameters
     MAX_RESEARCH_ATTEMPTS: int = 5
@@ -69,33 +127,80 @@ class Settings(BaseSettings):
     # Research agent parameters
     RESEARCH_TOP_K: int = 15
     RESEARCH_MAX_CONTEXT_CHARS: int = Field(default_factory=lambda: 800_000 if _is_hf() else 8000000000)
-    RESEARCH_MAX_OUTPUT_TOKENS: int = 500
+    RESEARCH_MAX_OUTPUT_TOKENS: int = 4000
+    RESEARCH_MIN_ANSWER_CHARS: int = 300
     NUM_RESEARCH_CANDIDATES: int = 2  # Number of research questions to generate
 
     # Verification parameters
     VERIFICATION_MAX_CONTEXT_CHARS: int = Field(default_factory=lambda: 300_000 if _is_hf() else 800000000)
-    VERIFICATION_MAX_OUTPUT_TOKENS: int = 300
+    VERIFICATION_MAX_OUTPUT_TOKENS: int = 128000
+    VERIFICATION_RETRY_MAX_OUTPUT_TOKENS: int = 128000
+    RELEVANCE_MAX_OUTPUT_TOKENS: int = 4000
+    RELEVANCE_RETRY_MAX_OUTPUT_TOKENS: int = 8000
 
     # Logging parameters
     LOG_LEVEL: str = "INFO"
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "smartdoc-ai"
+    OTEL_SERVICE_NAMESPACE: str = "smartrag"
+    OTEL_SERVICE_VERSION: str = "dev"
+    OTEL_RESOURCE_ATTRIBUTES: str = ""
+    OTEL_EXPORTER_OTLP_ENDPOINT: Optional[str] = None
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: Optional[str] = None
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: Optional[str] = None
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: Optional[str] = None
+    OTEL_EXPORTER_OTLP_HEADERS: Optional[str] = None  # format: key1=value1,key2=value2
+    OTEL_EXPORT_TIMEOUT_S: float = 10.0
+    OTEL_TRACES_ENABLED: bool = True
+    OTEL_METRICS_ENABLED: bool = True
+    OTEL_LOGS_ENABLED: bool = True
+    OTEL_METRICS_EXPORT_INTERVAL_MS: int = 10000
+    OTEL_CONSOLE_DEBUG_EXPORT: bool = False
 
     # Cache parameters
     CACHE_DIR: str = "document_cache"
     CACHE_EXPIRE_DAYS: int = 7
 
     # LLM parameters
+    LLM_PROVIDER: str = "openai"  # google | openai | azure
     LLM_MAX_RETRIES: int = 3
     LLM_RETRY_DELAY: float = 1.0
-    LLM_MODEL_NAME: str = "gemini-2.5-flash-lite"  # Default model for all agents
-    
+    LLM_MODEL_NAME: str = "gpt-4o-mini"  # Default model for all agents (low-cost GPT)
+    LLM_ROUTER_MAX_OUTPUT_TOKENS: int = 4000
+
     # Agent-specific LLM models (override LLM_MODEL_NAME if needed)
-    RESEARCH_AGENT_MODEL: str = "gemini-2.5-flash-lite"
-    VERIFICATION_AGENT_MODEL: str = "gemini-2.5-flash-lite"
-    RELEVANCE_CHECKER_MODEL: str = "gemini-2.5-flash-lite"
+    RESEARCH_AGENT_MODEL: str = "gpt-4o-mini"
+    VERIFICATION_AGENT_MODEL: str = "gpt-4o-mini"
+    RELEVANCE_CHECKER_MODEL: str = "gpt-4o-mini"
+
+    # Embeddings
+    EMBEDDING_PROVIDER: str = "openai"  # google | openai | azure
+    EMBEDDING_MODEL_NAME: str = "models/text-embedding-004"
+    OPENAI_EMBEDDING_MODEL_NAME: str = "text-embedding-3-small"
+    AZURE_EMBEDDING_DEPLOYMENT: Optional[str] = None
+    EMBEDDING_CACHE_ENABLED: bool = True
+    EMBEDDING_CACHE_DIR: str = "document_cache/embedding_cache"
+    EMBEDDING_CACHE_BATCH_SIZE: int = 128
+    EMBEDDING_INGEST_MAX_RETRIES: int = 4
+    EMBEDDING_BACKOFF_BASE_S: float = 1.0
+    EMBEDDING_BACKOFF_MAX_S: float = 12.0
+    EMBEDDING_BACKOFF_JITTER_RATIO: float = 0.25
+
+    # Performance metrics / alerting
+    PERF_METRICS_WINDOW: int = 200
+    PERF_ALERT_MIN_SAMPLES: int = 5
+    PERF_ALERT_COOLDOWN_S: int = 300
+    PERF_ALERT_PARSE_P95_S: float = 90.0
+    PERF_ALERT_CHART_PHASE1_P95_S: float = 120.0
+    PERF_ALERT_CHART_PHASE2_P95_S: float = 45.0
+    PERF_ALERT_EMBED_BATCH_P95_S: float = 10.0
+
+    # Vision / chart analysis
+    VISION_PROVIDER: str = "none"  # google | azure | none
 
     # Chart extraction parameters
     ENABLE_CHART_EXTRACTION: bool = True
-    CHART_VISION_MODEL: str = "gemini-2.5-flash-lite"
+    CHART_VISION_MODEL: str = "gemini-2.5-flash-lite"  # Use gpt-5-nano for Azure vision
     CHART_MAX_TOKENS: int = 1500
     CHART_DPI: int = Field(default_factory=lambda: 110 if _is_hf() else 110)  # Lower DPI saves memory
     CHART_BATCH_SIZE: int = Field(default_factory=lambda: 1 if _is_hf() else 1)  # Process pages in batches
@@ -111,15 +216,174 @@ class Settings(BaseSettings):
     CHART_GEMINI_BATCH_SIZE: int = 1  # Analyze 1 chart per API call (reduced from 2 for reliability)
     CHART_ENABLE_BATCH_ANALYSIS: bool = True  # Enable batch processing for speed
 
+    @field_validator("LLM_PROVIDER")
+    @classmethod
+    def validate_llm_provider(cls, v: str) -> str:
+        supported = {"google", "openai", "azure"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"LLM_PROVIDER must be one of {supported}")
+        return v_lower
+
+    @field_validator("VISION_PROVIDER")
+    @classmethod
+    def validate_vision_provider(cls, v: str) -> str:
+        supported = {"google", "azure", "none"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"VISION_PROVIDER must be one of {supported}")
+        return v_lower
+
+    @field_validator("EMBEDDING_PROVIDER")
+    @classmethod
+    def validate_embedding_provider(cls, v: str) -> str:
+        supported = {"google", "openai", "azure"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"EMBEDDING_PROVIDER must be one of {supported}")
+        return v_lower
+
+    @field_validator("PDF_PARSE_MODE")
+    @classmethod
+    def validate_pdf_parse_mode(cls, v: str) -> str:
+        supported = {"auto", "fast", "fidelity"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"PDF_PARSE_MODE must be one of {supported}")
+        return v_lower
+
+    @field_validator("PDF_PARSE_PAGE_RANGE_WORKERS", "PDF_PARSE_PAGE_RANGE_SIZE")
+    @classmethod
+    def validate_positive_pdf_parse_parallel_settings(cls, v: int, info) -> int:
+        if int(v) < 1:
+            raise ValueError(f"{info.field_name} must be >= 1")
+        return int(v)
+
+    @field_validator("OPENAI_API_KEY")
+    @classmethod
+    def validate_openai_api_key(cls, v: Optional[str], info) -> Optional[str]:
+        provider = info.data.get("LLM_PROVIDER")
+        embedding_provider = info.data.get("EMBEDDING_PROVIDER")
+        # If provider fields are not yet available (validation-order issue), defer to model-level validation.
+        if provider is None and embedding_provider is None:
+            return v
+        provider = (provider or "openai").lower()
+        embedding_provider = (embedding_provider or "openai").lower()
+        needs_openai = provider == "openai" or embedding_provider == "openai"
+        if needs_openai and (not v or not v.strip() or v.startswith("your_") or v == "YOUR_API_KEY_HERE"):
+            raise ValueError("OPENAI_API_KEY is required when using OpenAI provider. Set it in your .env file.")
+        return v
+
+    @field_validator("AZURE_OPENAI_API_KEY")
+    @classmethod
+    def validate_azure_api_key(cls, v: Optional[str], info) -> Optional[str]:
+        provider = info.data.get("LLM_PROVIDER")
+        if provider is None:
+            return v
+        provider = (provider or "openai").lower()
+        if provider == "azure" and (not v or not v.strip() or v.startswith("your_") or v == "YOUR_API_KEY_HERE"):
+            raise ValueError("AZURE_OPENAI_API_KEY is required when LLM_PROVIDER=azure. Set it in your .env file.")
+        return v
+
+    @field_validator("AZURE_OPENAI_ENDPOINT")
+    @classmethod
+    def validate_azure_endpoint(cls, v: Optional[str], info) -> Optional[str]:
+        provider = info.data.get("LLM_PROVIDER")
+        if provider is None:
+            return v
+        provider = (provider or "openai").lower()
+        if provider == "azure" and (not v or not v.strip()):
+            raise ValueError("AZURE_OPENAI_ENDPOINT is required when LLM_PROVIDER=azure.")
+        return v
+
+    @field_validator("AZURE_OPENAI_DEPLOYMENT")
+    @classmethod
+    def validate_azure_deployment(cls, v: Optional[str], info) -> Optional[str]:
+        provider = info.data.get("LLM_PROVIDER")
+        if provider is None:
+            return v
+        provider = provider.lower()
+        if provider == "azure" and (not v or not v.strip()):
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT is required when using Azure OpenAI chat.")
+        return v
+
     @field_validator("GOOGLE_API_KEY")
     @classmethod
-    def validate_api_key(cls, v: str) -> str:
-        """Validate that API key is provided and not a placeholder."""
-        if not v or v.strip() == "":
-            raise ValueError("GOOGLE_API_KEY is required. Set it in your .env file or HF Secrets.")
-        if v.startswith("your_") or v == "YOUR_API_KEY_HERE":
-            raise ValueError("Please replace the placeholder GOOGLE_API_KEY with your actual API key.")
+    def validate_google_api_key(cls, v: Optional[str], info) -> Optional[str]:
+        provider = info.data.get("LLM_PROVIDER")
+        vision_provider = info.data.get("VISION_PROVIDER")
+        embedding_provider = info.data.get("EMBEDDING_PROVIDER")
+        if provider is None and vision_provider is None and embedding_provider is None:
+            return v
+        provider = (provider or "openai").lower()
+        vision_provider = (vision_provider or "none").lower()
+        embedding_provider = (embedding_provider or "openai").lower()
+        needs_google = provider == "google" or vision_provider == "google" or embedding_provider == "google"
+        if needs_google and (not v or not v.strip() or v.startswith("your_") or v == "YOUR_API_KEY_HERE"):
+            raise ValueError("GOOGLE_API_KEY is required when using Google provider. Set it in your .env file or HF Secrets.")
         return v
+
+    @model_validator(mode="after")
+    def validate_provider_credentials(self):
+        provider = (self.LLM_PROVIDER or "").lower()
+        embedding_provider = (self.EMBEDDING_PROVIDER or "").lower()
+        vision_provider = (self.VISION_PROVIDER or "").lower()
+
+        def _is_valid_key(value: Optional[str]) -> bool:
+            if not value:
+                return False
+            cleaned = value.strip()
+            if not cleaned:
+                return False
+            if cleaned.startswith("your_") or cleaned == "YOUR_API_KEY_HERE":
+                return False
+            return True
+
+        if provider == "openai" or embedding_provider == "openai":
+            if not self.OPENAI_API_KEY or not self.OPENAI_API_KEY.strip() or self.OPENAI_API_KEY.startswith("your_") or self.OPENAI_API_KEY == "YOUR_API_KEY_HERE":
+                raise ValueError("OPENAI_API_KEY is required when using OpenAI provider. Set it in your .env file.")
+
+        if provider == "azure":
+            if not _is_valid_key(self.AZURE_OPENAI_API_KEY):
+                raise ValueError("AZURE_OPENAI_API_KEY is required when LLM_PROVIDER=azure. Set it in your .env file.")
+            if not self.AZURE_OPENAI_ENDPOINT or not self.AZURE_OPENAI_ENDPOINT.strip():
+                raise ValueError("AZURE_OPENAI_ENDPOINT is required when LLM_PROVIDER=azure.")
+            if not self.AZURE_OPENAI_DEPLOYMENT or not self.AZURE_OPENAI_DEPLOYMENT.strip():
+                raise ValueError("AZURE_OPENAI_DEPLOYMENT is required when using Azure OpenAI chat.")
+            api_version = (self.AZURE_OPENAI_API_VERSION or "").strip()
+            version_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", api_version)
+            if not version_match:
+                raise ValueError(
+                    "AZURE_OPENAI_API_VERSION must start with an ISO date (e.g., 2024-08-01-preview) "
+                    "when LLM_PROVIDER=azure."
+                )
+            year, month, day = map(int, version_match.groups())
+            if (year, month, day) < (2024, 8, 1):
+                raise ValueError(
+                    "AZURE_OPENAI_API_VERSION must be 2024-08-01-preview or later when LLM_PROVIDER=azure "
+                    "because structured json_schema output is required."
+                )
+
+        if embedding_provider == "azure":
+            has_embedding_key = _is_valid_key(self.AZURE_EMBEDDING_API_KEY) or _is_valid_key(self.AZURE_OPENAI_API_KEY)
+            if not has_embedding_key:
+                raise ValueError(
+                    "Azure embeddings require AZURE_EMBEDDING_API_KEY or AZURE_OPENAI_API_KEY."
+                )
+            has_embedding_endpoint = bool(self.AZURE_EMBEDDING_ENDPOINT and self.AZURE_EMBEDDING_ENDPOINT.strip())
+            has_chat_endpoint = bool(self.AZURE_OPENAI_ENDPOINT and self.AZURE_OPENAI_ENDPOINT.strip())
+            if not (has_embedding_endpoint or has_chat_endpoint):
+                raise ValueError(
+                    "Azure embeddings require AZURE_EMBEDDING_ENDPOINT or AZURE_OPENAI_ENDPOINT."
+                )
+            if not self.AZURE_EMBEDDING_DEPLOYMENT or not self.AZURE_EMBEDDING_DEPLOYMENT.strip():
+                raise ValueError("AZURE_EMBEDDING_DEPLOYMENT is required when EMBEDDING_PROVIDER=azure.")
+
+        if provider == "google" or vision_provider == "google" or embedding_provider == "google":
+            if not self.GOOGLE_API_KEY or not self.GOOGLE_API_KEY.strip() or self.GOOGLE_API_KEY.startswith("your_") or self.GOOGLE_API_KEY == "YOUR_API_KEY_HERE":
+                raise ValueError("GOOGLE_API_KEY is required when using Google provider. Set it in your .env file or HF Secrets.")
+
+        return self
 
 
 def _get_parameters():

@@ -100,6 +100,9 @@ tmp/
 temp/
 *.tmp
 
+# Benchmark outputs
+docs/perf/benchmarks/*.json
+
 # Hugging Face Spaces
 .gradio/
 flagged/

@@ -6,6 +6,7 @@ sys.path.insert(0, r'd:\MultiRAGgent\docchat')
 
 from content_analyzer.document_parser import DocumentProcessor
 from search_engine.indexer import RetrieverBuilder
+from configuration import parameters
 from pathlib import Path
 
 # Initialize
@@ -41,25 +42,30 @@ print(f"{'='*80}\n")
 
 print(f"[TOKEN_ANALYSIS] Retrieved {len(retrieved_docs)} documents")
 
+provider = parameters.parameters.LLM_PROVIDER.lower()
+chars_per_token = 3 if provider == "google" else 4
+
 # Character and token analysis
 total_chars = sum(len(doc.page_content) for doc in retrieved_docs)
 # Different tokenization estimates
-tokens_gpt = total_chars / 4  # ~4 chars per token (GPT)
-tokens_gemini = total_chars / 3  # ~3 chars per token (Gemini - more aggressive)
-tokens_claude = total_chars / 4.5  # ~4.5 chars per token (Claude)
+tokens_est = total_chars / chars_per_token
+tokens_gpt = total_chars / 4  # reference
+tokens_gemini = total_chars / 3  # reference
+tokens_claude = total_chars / 4.5  # reference
 
 if retrieved_docs:
     avg_chars = total_chars // len(retrieved_docs)
-    avg_tokens_gemini = avg_chars // 3
+    avg_tokens_est = avg_chars // chars_per_token
     
     print(f"\n[CHARACTER COUNT]")
     print(f"  Total characters: {total_chars:,}")
     print(f"  Average per doc:  {avg_chars:,} chars")
     
     print(f"\n[TOKEN COUNT ESTIMATES]")
+    print(f"  Provider ({provider}) est: {tokens_est:,.0f} tokens")
     print(f"  Gemini (1 token ≈ 3 chars): {tokens_gemini:,.0f} tokens")
     print(f"  GPT/Claude (1 token ≈ 4 chars): {tokens_gpt:,.0f} tokens")
-    print(f"  Average per doc (Gemini): {avg_tokens_gemini:,} tokens")
+    print(f"  Average per doc (provider est): {avg_tokens_est:,} tokens")
     
     print(f"\n[QUOTA ANALYSIS]")
     print(f"  Gemini free tier limit: 250,000 tokens/day")

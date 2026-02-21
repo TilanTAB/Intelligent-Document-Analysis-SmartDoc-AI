@@ -6,6 +6,7 @@ anyio>=4.8.0
 
 # PDF Processing
 pdfplumber>=0.11.0
+pypdf>=6.7.0
 pdf2image>=1.17.0
 Pillow>=10.0.0
 
@@ -17,11 +18,15 @@ langchain>=0.3.16
 langchain-core>=0.3.32
 langchain-text-splitters>=0.3.5
 langchain-google-genai>=2.0.0
+langchain-openai>=0.2.11
 langchain-community>=0.3.16
 langchain-chroma>=0.1.0
 
 # Google AI for chart analysis
 google-generativeai>=0.8.0
+
+# OpenAI
+openai>=1.57.0
 
 # Vector store
 chromadb>=0.6.3
@@ -45,6 +50,11 @@ python-dotenv>=1.0.1
 
 # BM25 retriever
 rank-bm25>=0.2.2
+
+# Observability (OpenTelemetry)
+opentelemetry-api>=1.39.0
+opentelemetry-sdk>=1.39.0
+opentelemetry-exporter-otlp-proto-http>=1.39.0
 
 # Utilities
 tqdm>=4.67.0

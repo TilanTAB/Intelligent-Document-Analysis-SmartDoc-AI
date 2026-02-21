@@ -3,7 +3,7 @@ Verification agent module for answer validation against source documents.
 """
 from typing import Dict, List, Optional, Literal
 from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI
+from core.llm_factory import get_chat_llm, get_structured_llm
 from pydantic import BaseModel, Field
 import logging
 
@@ -67,7 +67,7 @@ class VerificationAgent:
 
     def __init__(
         self,
-        llm: Optional[ChatGoogleGenerativeAI] = None,
+        llm=None,
         max_context_chars: int = None,
         max_output_tokens: int = None,
     ) -> None:
@@ -75,47 +75,136 @@ class VerificationAgent:
         logger.info("Initializing VerificationAgent...")
 
         self.max_context_chars = max_context_chars or parameters.VERIFICATION_MAX_CONTEXT_CHARS
-        self.max_output_tokens = max_output_tokens or parameters.VERIFICATION_MAX_OUTPUT_TOKENS
+        self.max_output_tokens = int(max_output_tokens or parameters.VERIFICATION_MAX_OUTPUT_TOKENS)
+        self.retry_max_output_tokens = max(
+            self.max_output_tokens,
+            int(parameters.VERIFICATION_RETRY_MAX_OUTPUT_TOKENS),
+        )
         
-        base_llm = llm or ChatGoogleGenerativeAI(
-            model=parameters.VERIFICATION_AGENT_MODEL,
-            google_api_key=parameters.GOOGLE_API_KEY,
+        base_llm = llm or get_chat_llm(
+            role="verification",
+            model_name=parameters.VERIFICATION_AGENT_MODEL,
             temperature=0,
             max_output_tokens=self.max_output_tokens,
         )
-        
+
         self.llm = base_llm
-        self.structured_llm = base_llm.with_structured_output(VerificationResult)
-        self.selection_llm = base_llm.with_structured_output(BestAnswerSelection)
+        self.llm_retry = (
+            get_chat_llm(
+                role="verification_retry",
+                model_name=parameters.VERIFICATION_AGENT_MODEL,
+                temperature=0,
+                max_output_tokens=self.retry_max_output_tokens,
+            )
+            if self.retry_max_output_tokens > self.max_output_tokens
+            else base_llm
+        )
+        self.structured_llm = get_structured_llm(
+            schema=VerificationResult,
+            role="verification_structured",
+            model_name=parameters.VERIFICATION_AGENT_MODEL,
+            temperature=0,
+            max_output_tokens=self.max_output_tokens,
+        )
+        self.structured_llm_retry = (
+            get_structured_llm(
+                schema=VerificationResult,
+                role="verification_structured_retry",
+                model_name=parameters.VERIFICATION_AGENT_MODEL,
+                temperature=0,
+                max_output_tokens=self.retry_max_output_tokens,
+            )
+            if self.retry_max_output_tokens > self.max_output_tokens
+            else self.structured_llm
+        )
+        self.selection_llm = get_structured_llm(
+            schema=BestAnswerSelection,
+            role="verification_selection",
+            model_name=parameters.VERIFICATION_AGENT_MODEL,
+            temperature=0,
+            max_output_tokens=self.max_output_tokens,
+        )
+        self.selection_llm_retry = (
+            get_structured_llm(
+                schema=BestAnswerSelection,
+                role="verification_selection_retry",
+                model_name=parameters.VERIFICATION_AGENT_MODEL,
+                temperature=0,
+                max_output_tokens=self.retry_max_output_tokens,
+            )
+            if self.retry_max_output_tokens > self.max_output_tokens
+            else self.selection_llm
+        )
         
         logger.info(f"VerificationAgent initialized (model={parameters.VERIFICATION_AGENT_MODEL})")
 
+    @staticmethod
+    def _is_length_limit_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            "length limit was reached" in message
+            or ("max tokens" in message and "reached" in message)
+            or ("max_output_tokens" in message and "reached" in message)
+        )
+
+    @staticmethod
+    def _parse_verification_result(result) -> Optional[VerificationResult]:
+        if isinstance(result, VerificationResult):
+            return result
+        try:
+            return VerificationResult.model_validate(result)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_selection_result(result) -> Optional[BestAnswerSelection]:
+        if isinstance(result, BestAnswerSelection):
+            return result
+        try:
+            return BestAnswerSelection.model_validate(result)
+        except Exception:
+            return None
+
+    def _build_context(
+        self,
+        documents: List[Document],
+    ) -> str:
+        blocks: List[str] = []
+        for idx, doc in enumerate(documents, start=1):
+            text = (doc.page_content or "").strip()
+            if not text:
+                continue
+            page = doc.metadata.get("page", "?") if isinstance(doc.metadata, dict) else "?"
+            blocks.append(f"[Doc {idx} | page {page}] {text}")
+        context = "\n\n".join(blocks)
+        if self.max_context_chars and len(context) > self.max_context_chars:
+            context = context[:self.max_context_chars]
+        return context
+
+    def _build_candidates(self, candidate_answers: List[str]) -> str:
+        items = []
+        for i, answer in enumerate(candidate_answers):
+            items.append(f"[Candidate {i}] {(answer or '').strip()}")
+        return "\n\n".join(items)
+
     def generate_prompt(self, answer: str, context: str, question: Optional[str] = None) -> str:
         """Generate verification prompt."""
-        question_section = f"\n**Original Question:** {question}\n" if question else ""
-        
-        return f"""Verify the following answer against the provided context.
+        question_section = f"Question: {question}\n" if question else ""
 
-**Check for:**
-1. Factual support (YES/NO/PARTIAL)
-2. Confidence level (HIGH/MEDIUM/LOW)
-3. Unsupported claims
-4. Contradictions
-5. Relevance to question
-6. Completeness (COMPLETE/PARTIAL/INCOMPLETE)
+        return f"""Verify the answer against context.
 
-**Scoring:**
-- HIGH: All claims directly stated, no ambiguity
-- MEDIUM: Most claims supported, some inferred
-- LOW: Significant claims unsupported
-{question_section}
-**Answer to Verify:**
+{question_section}Answer:
 {answer}
 
-**Context:**
+Context:
 {context}
 
-Provide your verification analysis."""
+Return only schema fields.
+Rules:
+- supported: YES/PARTIAL/NO
+- relevant: YES/NO
+- completeness: COMPLETE/PARTIAL/INCOMPLETE
+- list unsupported_claims and contradictions as needed."""
 
     def format_verification_report(self, verification: VerificationResult) -> str:
         """Format verification result into readable report."""
@@ -198,24 +287,49 @@ Provide your verification analysis."""
         """
         logger.info(f"Verifying answer ({len(answer)} chars) against {len(documents)} documents")
 
-        context = "\n\n".join([doc.page_content for doc in documents])
-        
-        if len(context) > self.max_context_chars:
-            logger.debug(f"Context truncated: {len(context)} -> {self.max_context_chars}")
-            context = context[:self.max_context_chars]
+        context = self._build_context(documents=documents)
+        if not context:
+            context = "No usable context extracted from documents."
 
         prompt = self.generate_prompt(answer, context, question)
 
         try:
             logger.debug("Calling LLM for verification...")
-            verification_result: VerificationResult = self.structured_llm.invoke(prompt)
+            verification_raw = self.structured_llm.invoke(prompt)
+            verification_result = self._parse_verification_result(verification_raw)
+            if verification_result is None:
+                raise ValueError("Structured verifier returned unexpected output format.")
             logger.info(f"Verification: {verification_result.supported} ({verification_result.confidence})")
             
         except Exception as e:
+            if self._is_length_limit_error(e) and self.structured_llm_retry is not self.structured_llm:
+                logger.warning(
+                    "Verification hit output token limit; retrying with a higher token budget "
+                    f"({self.retry_max_output_tokens})."
+                )
+                try:
+                    retry_raw = self.structured_llm_retry.invoke(prompt)
+                    retry_result = self._parse_verification_result(retry_raw)
+                    if retry_result is not None:
+                        verification_result = retry_result
+                        logger.info(f"Verification: {verification_result.supported} ({verification_result.confidence}) [retry]")
+                        verification_report = self.format_verification_report(verification_result)
+                        feedback = self.generate_feedback_for_research(verification_result)
+                        return {
+                            "verification_report": verification_report,
+                            "context_used": context,
+                            "structured_result": verification_result.model_dump(),
+                            "should_retry": self.should_retry_research(verification_result, verification_report, feedback),
+                            "feedback": feedback
+                        }
+                except Exception as retry_error:
+                    logger.error(f"Verification retry failed: {retry_error}")
+
             logger.error(f"Structured output failed: {e}")
             
             try:
-                response = self.llm.invoke(prompt)
+                fallback_llm = self.llm_retry if self._is_length_limit_error(e) else self.llm
+                response = fallback_llm.invoke(prompt)
                 report = response.content if hasattr(response, "content") else str(response)
                 verification_result = self._parse_unstructured_response(report.strip())
             except Exception as fallback_error:
@@ -279,38 +393,32 @@ Provide your verification analysis."""
                 "confidence": "MEDIUM"
             }
         
-        context = "\n\n".join([doc.page_content for doc in documents])
-        if len(context) > self.max_context_chars:
-            logger.debug(f"Context truncated: {len(context)} -> {self.max_context_chars}")
-            context = context[:self.max_context_chars]
+        context = self._build_context(documents=documents)
+        if not context:
+            context = "No usable context extracted from documents."
         
-        candidates_text = ""
-        for i, answer in enumerate(candidate_answers):
-            candidates_text += f"\n**Candidate {i + 1}:**\n{answer}\n"
+        candidates_text = self._build_candidates(candidate_answers)
         
-        prompt = f"""You are evaluating multiple candidate answers to select the best one.
+        prompt = f"""Select the best candidate answer.
 
-**Original Question:** {question}
+Question: {question}
 
-**Candidate Answers:**
+Candidates (0-based):
 {candidates_text}
 
-**Source Context:**
+Context:
 {context}
 
-**Evaluation Criteria:**
-1. **Factual Accuracy**: Which answer is most accurately supported by the context?
-2. **Completeness**: Which answer most thoroughly addresses the question?
-3. **Relevance**: Which answer stays most focused on what was asked?
-4. **No Contradictions**: Which answer has the fewest contradictions with the source?
-5. **Clarity**: Which answer is clearest and most well-structured?
-
-Select the best answer by providing its index (0-based) and explain your reasoning."""
+Select by factual support, completeness, relevance, and clarity.
+Return only schema fields with concise text."""
 
         try:
             logger.debug("Calling LLM for best answer selection...")
-            selection_result: BestAnswerSelection = self.selection_llm.invoke(prompt)
-            
+            selection_raw = self.selection_llm.invoke(prompt)
+            selection_result = self._parse_selection_result(selection_raw)
+            if selection_result is None:
+                raise ValueError("Selection model returned unexpected output format.")
+
             selected_index = selection_result.selected_index
             if selected_index < 0 or selected_index >= len(candidate_answers):
                 logger.warning(f"Invalid selection index {selected_index}, defaulting to 0")
@@ -327,13 +435,47 @@ Select the best answer by providing its index (0-based) and explain your reasoni
             }
             
         except Exception as e:
+            if self._is_length_limit_error(e) and self.selection_llm_retry is not self.selection_llm:
+                logger.warning(
+                    "Best-answer selection hit output token limit; retrying with a higher token budget "
+                    f"({self.retry_max_output_tokens})."
+                )
+                try:
+                    retry_raw = self.selection_llm_retry.invoke(prompt)
+                    retry_result = self._parse_selection_result(retry_raw)
+                    if retry_result is not None:
+                        selected_index = retry_result.selected_index
+                        if selected_index < 0 or selected_index >= len(candidate_answers):
+                            selected_index = 0
+                        logger.info(f"Selected candidate {selected_index + 1} with {retry_result.confidence} confidence [retry]")
+                        return {
+                            "selected_answer": candidate_answers[selected_index],
+                            "selected_index": selected_index,
+                            "reasoning": retry_result.reasoning,
+                            "confidence": retry_result.confidence,
+                            "comparison_summary": retry_result.comparison_summary
+                        }
+                except Exception as retry_error:
+                    logger.error(f"Best answer selection retry failed: {retry_error}")
+
             logger.error(f"Best answer selection failed: {e}")
-            # Fallback: return the first candidate
+            # Fallback: choose the most substantial candidate instead of always picking index 0.
+            fallback_index = max(
+                range(len(candidate_answers)),
+                key=lambda i: len((candidate_answers[i] or "").strip()),
+            )
+            fallback_len = len((candidate_answers[fallback_index] or "").strip())
+            logger.warning(
+                "Falling back to candidate %d based on max content length (%d chars).",
+                fallback_index + 1,
+                fallback_len,
+            )
             return {
-                "selected_answer": candidate_answers[0],
-                "selected_index": 0,
-                "reasoning": f"Selection failed, using first candidate: {str(e)}",
-                "confidence": "LOW"
+                "selected_answer": candidate_answers[fallback_index],
+                "selected_index": fallback_index,
+                "reasoning": f"Selection failed, using longest candidate: {str(e)}",
+                "confidence": "LOW",
+                "comparison_summary": ""
             }
 
     def _parse_unstructured_response(self, response_text: str) -> VerificationResult:

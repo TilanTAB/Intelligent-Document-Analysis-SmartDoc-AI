@@ -1,17 +1,19 @@
-import configuration.logger_setup
 import logging
+from configuration.logger_setup import configure_logging
 
 logger = logging.getLogger(__name__)
 
 import hashlib
+import inspect
 import socket
-from typing import List, Dict
+from typing import Any, List, Dict
 import os
 import shutil
 from pathlib import Path
 from datetime import datetime
 import time
 import random
+import re
 from collections import defaultdict, deque
 import threading
 
@@ -19,6 +21,13 @@ from content_analyzer.document_parser import DocumentProcessor
 from search_engine.indexer import RetrieverBuilder
 from intelligence.orchestrator import AgentWorkflow
 from configuration import definitions, parameters
+from core.telemetry import (
+    initialize_telemetry,
+    mark_span_error,
+    record_request_metrics,
+    start_span,
+)
+from core.user_analytics import get_analytics_logger
                              
 
 # Rate limiting configuration - 3 requests per hour per IP
@@ -111,7 +120,6 @@ def format_document_context(documents: List, question: str = "") -> str:
         # Highlight key terms
         highlighted_content = content
         for term in key_terms[:5]:
-            import re
             pattern = re.compile(re.escape(term), re.IGNORECASE)
             highlighted_content = pattern.sub(f"**{term}**", highlighted_content)
     
@@ -183,6 +191,10 @@ def _setup_gradio_shim():
 
 
 def main():
+    # Configure logging explicitly at runtime (no import-time side effects).
+    configure_logging()
+    initialize_telemetry()
+
     _ensure_hfhub_hffolder_compat()  # must run before importing gradio
     import gradio as gr
     _setup_gradio_shim()
@@ -195,6 +207,7 @@ def main():
     processor = DocumentProcessor()
     retriever_indexer = RetrieverBuilder()
     orchestrator = AgentWorkflow()
+    analytics_logger = get_analytics_logger()
 
     logger.info("All components initialized successfully")
 
@@ -632,9 +645,83 @@ setInterval(tick, 500);
     # HF Spaces sets SPACE_ID environment variable
     is_hf_space = os.environ.get("SPACE_ID") is not None
 
-    with gr.Blocks(title="SmartDoc AI") as demo:
+    with gr.Blocks(title="SmartDoc AI", theme=gr.themes.Soft(), css=css) as demo:
         gr.Markdown("### SmartDoc AI - Document Q&A", elem_classes="app-title")
         gr.Markdown("Upload your documents and ask questions. Answers will appear below, just like a chat.", elem_classes="app-description")
+        gr.Markdown("---")
+
+        llm_provider = parameters.LLM_PROVIDER.lower()
+        has_openai_env_key = bool(parameters.OPENAI_API_KEY and parameters.OPENAI_API_KEY.strip())
+        has_azure_env_config = bool(
+            parameters.AZURE_OPENAI_API_KEY
+            and parameters.AZURE_OPENAI_ENDPOINT
+            and parameters.AZURE_OPENAI_DEPLOYMENT
+        )
+        has_google_env_key = bool(parameters.GOOGLE_API_KEY and parameters.GOOGLE_API_KEY.strip())
+
+        show_openai_key_input = llm_provider == "openai" and not has_openai_env_key
+
+        if llm_provider == "openai":
+            api_key_status_default = (
+                "🟢 Using OpenAI API key from environment"
+                if has_openai_env_key
+                else "🟡 OPENAI_API_KEY not found in environment. Enter a key below."
+            )
+        elif llm_provider == "azure":
+            api_key_status_default = (
+                "🟢 Using Azure OpenAI credentials from environment"
+                if has_azure_env_config
+                else "🔴 Azure OpenAI credentials are incomplete in environment"
+            )
+        else:
+            api_key_status_default = (
+                "🟢 Using Google API key from environment"
+                if has_google_env_key
+                else "🔴 GOOGLE_API_KEY not found in environment"
+            )
+
+        if show_openai_key_input:
+            with gr.Row():
+                openai_api_key = gr.Textbox(
+                    label="OpenAI API Key",
+                    placeholder="sk-...",
+                    type="password",
+                    info="Only needed when OPENAI_API_KEY is not set in .env"
+                )
+                api_key_status = gr.Markdown(api_key_status_default, elem_classes="info-panel")
+
+            def validate_openai_key(api_key):
+                """Validate OpenAI API key format and connectivity."""
+                if not api_key or not api_key.strip():
+                    return "🔴 No key provided"
+
+                if not api_key.startswith("sk-"):
+                    return "🔴 Invalid format (must start with sk-)"
+
+                # Set it in environment for the LLM factory to use.
+                os.environ["OPENAI_API_KEY"] = api_key
+                parameters.OPENAI_API_KEY = api_key
+
+                # Validate by trying to initialize the configured LLM.
+                try:
+                    from core.llm_factory import get_chat_llm
+                    get_chat_llm(
+                        role="test",
+                        model_name=parameters.LLM_MODEL_NAME,
+                        max_output_tokens=parameters.LLM_ROUTER_MAX_OUTPUT_TOKENS,
+                    )
+                    return "🟢 Authenticated with OpenAI"
+                except Exception as e:
+                    return f"🔴 Authentication failed: {str(e)[:100]}"
+
+            openai_api_key.change(
+                validate_openai_key,
+                inputs=[openai_api_key],
+                outputs=[api_key_status]
+            )
+        else:
+            gr.Markdown(api_key_status_default, elem_classes="info-panel")
+
         gr.Markdown("---")
 
         # Examples dropdown - visible for both local and HF Spaces
@@ -648,7 +735,12 @@ setInterval(tick, 500);
 
         files = gr.Files(label="Upload your files", file_types=definitions.ALLOWED_TYPES)
         question = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
-        chat = gr.Chatbot(label="Answers", elem_id="chat-history")
+        # Gradio 6 removed the `type` argument from Chatbot.
+        # Keep compatibility across Gradio versions by probing the signature.
+        chatbot_kwargs = {"label": "Answers", "elem_id": "chat-history"}
+        if "type" in inspect.signature(gr.Chatbot.__init__).parameters:
+            chatbot_kwargs["type"] = "messages"
+        chat = gr.Chatbot(**chatbot_kwargs)
         submit_btn = gr.Button("Get Answer", variant="primary")
         processing_message = gr.HTML("", elem_id="processing-message", visible=False)
         doc_context_display = gr.Markdown("*Submit a question to see which document sections were referenced*", elem_classes="doc-context", visible=False)
@@ -666,8 +758,38 @@ setInterval(tick, 500);
         })
 
         def process_question(question_text, uploaded_files, chat_history, request: gr.Request):
-            rate_limit(request)
-            chat_history = chat_history or []            
+            run_started_at = time.perf_counter()
+            metric_attrs = {
+                "llm_provider": parameters.LLM_PROVIDER,
+                "embedding_provider": parameters.EMBEDDING_PROVIDER,
+                "has_uploads": bool(uploaded_files),
+            }
+            # Get user IP for logging and rate limiting
+            ip_address = getattr(request.client, "host", "unknown")
+            try:
+                rate_limit(request)
+            except Exception:
+                metric_attrs["failure_reason"] = "rate_limit"
+                record_request_metrics(
+                    duration_s=time.perf_counter() - run_started_at,
+                    success=False,
+                    extra_attributes=metric_attrs,
+                )
+                raise
+            chat_history = chat_history or []
+            
+            # Get file metadata for logging
+            file_types = [Path(f.name).suffix.lower() for f in uploaded_files] if uploaded_files else []
+            
+            # Log the question attempt
+            analytics_logger.log_question(
+                ip_address=ip_address,
+                question=question_text,
+                num_files=len(uploaded_files) if uploaded_files else 0,
+                file_types=file_types,
+                success=False  # Will update to True on success
+            )
+            
             yield (
                 chat_history,
                 gr.update(visible=False),
@@ -677,13 +799,26 @@ setInterval(tick, 500);
                 gr.update(interactive=False),
                 gr.update(interactive=False),
                 gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
             )
             try:
                 if not question_text.strip():
-               
+                    analytics_logger.log_question(
+                        ip_address=ip_address,
+                        question=question_text,
+                        num_files=len(uploaded_files) if uploaded_files else 0,
+                        file_types=file_types,
+                        success=False,
+                        error="Empty question"
+                    )
+                    metric_attrs["failure_reason"] = "validation_empty_question"
+                    record_request_metrics(
+                        duration_s=time.perf_counter() - run_started_at,
+                        success=False,
+                        extra_attributes=metric_attrs,
+                    )
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please enter a question."})
                     yield (
@@ -697,8 +832,21 @@ setInterval(tick, 500);
                         gr.update(value="", visible=False)
                     )
                     return
-                if not uploaded_files:                         
-              
+                if not uploaded_files:
+                    analytics_logger.log_question(
+                        ip_address=ip_address,
+                        question=question_text,
+                        num_files=0,
+                        file_types=[],
+                        success=False,
+                        error="No files uploaded"
+                    )
+                    metric_attrs["failure_reason"] = "validation_no_files"
+                    record_request_metrics(
+                        duration_s=time.perf_counter() - run_started_at,
+                        success=False,
+                        extra_attributes=metric_attrs,
+                    )
                     chat_history.append({"role": "user", "content": question_text})
                     chat_history.append({"role": "assistant", "content": "Please upload at least one document."})
                     yield (
@@ -712,11 +860,31 @@ setInterval(tick, 500);
                         gr.update(value="", visible=False)
                     )
                     return
-                # Stage 2: Chunking with per-chunk progress and rotating status
-                def load_or_process(file):
+                if not isinstance(session_state.value, dict):
+                    session_state.value = {}
+
+                # Build a stable signature for the current upload set.
+                file_entries = []
+                for file in uploaded_files:
                     with open(file.name, "rb") as f:
                         file_content = f.read()
                     file_hash = processor._generate_hash(file_content)
+                    file_entries.append((file, file_hash))
+                current_file_hashes = tuple(sorted(file_hash for _, file_hash in file_entries))
+
+                cached_hashes = tuple(session_state.value.get("file_hashes") or ())
+                cached_retriever = session_state.value.get("retriever")
+                retriever = None
+                used_cached_retriever = False
+
+                # Stage 2/3 can be skipped when files are unchanged in this session.
+                if cached_retriever is not None and cached_hashes == current_file_hashes:
+                    retriever = cached_retriever
+                    used_cached_retriever = True
+                    logger.info("Using session-cached retriever (file set unchanged).")
+
+                # Stage 2: Chunking with per-chunk progress and rotating status
+                def load_or_process(file, file_hash):
                     cache_path = processor.cache_dir / f"{file_hash}.pkl"
                     if processor._is_cache_valid(cache_path):
                         chunks = processor._load_from_cache(cache_path)
@@ -727,70 +895,73 @@ setInterval(tick, 500);
                     processor._save_to_cache(chunks, cache_path)
                     return chunks
 
-                all_chunks = []
-                seen_hashes = set()
-                chunks_by_file = []
-                total_chunks = 0
-                for file in uploaded_files:
-                    chunks = load_or_process(file)
-                    chunks_by_file.append(chunks)
-                    total_chunks += len(chunks)
-                if total_chunks == 0:
-                    total_chunks = 1
-                chunk_idx = 0
-                for chunks in chunks_by_file:
-                    for chunk in chunks:
-                        chunk_hash = processor._generate_hash(chunk.page_content.encode())
-                        if chunk_hash not in seen_hashes:
-                            seen_hashes.add(chunk_hash)
-                            all_chunks.append(chunk)
-                        # else: skip duplicate chunk
-                        chunk_idx += 1
-                        # yield progress here if needed
-                        yield (
-                            chat_history,
-                            gr.update(visible=False),
-                            gr.update(visible=False),
-                            gr.update(interactive=False),
-                            gr.update(interactive=False),
-                            gr.update(interactive=False),
-                            gr.update(interactive=False),
-                            gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+                if retriever is None:
+                    all_chunks = []
+                    seen_hashes = set()
+                    chunks_by_file = []
+                    total_chunks = 0
+                    for file, file_hash in file_entries:
+                        chunks = load_or_process(file, file_hash)
+                        chunks_by_file.append(chunks)
+                        total_chunks += len(chunks)
+                    if total_chunks == 0:
+                        total_chunks = 1
+                    chunk_idx = 0
+                    for chunks in chunks_by_file:
+                        for chunk in chunks:
+                            chunk_hash = processor._generate_hash(chunk.page_content.encode())
+                            if chunk_hash not in seen_hashes:
+                                seen_hashes.add(chunk_hash)
+                                all_chunks.append(chunk)
+                            # else: skip duplicate chunk
+                            chunk_idx += 1
+                            # yield progress here if needed
+                            yield (
+                                chat_history,
+                                gr.update(visible=False),
+                                gr.update(visible=False),
+                                gr.update(interactive=False),
+                                gr.update(interactive=False),
+                                gr.update(interactive=False),
+                                gr.update(interactive=False),
+                                gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
-                        )
-                # After all chunks, show 100%                    
-                yield (
-                    chat_history,
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+                            )
+                    # After all chunks, show 100%
+                    yield (
+                        chat_history,
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
-                )
-                # Stage 3: Building Retriever
-                yield (
-                    chat_history,
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(interactive=False),
-                    gr.update(value=(
-                        '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
-                        '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
-                        '<span id="processing-msg"></span>'
-                        '</div>'
-                    ), visible=True)
-                )
-                retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
+                    )
+                    # Stage 3: Building Retriever
+                    yield (
+                        chat_history,
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(value=(
+                            '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
+                            '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
+                            '<span id="processing-msg">Processing your request...</span>'
+                            '</div>'
+                        ), visible=True)
+                    )
+                    retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
+                    session_state.value["retriever"] = retriever
+                    session_state.value["file_hashes"] = current_file_hashes
                 # Stage 4: Generating Answer
                 yield (
                     chat_history,
@@ -801,12 +972,30 @@ setInterval(tick, 500);
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
                 )
-                result = orchestrator.run_workflow(question=question_text, retriever=retriever)
+                with start_span(
+                    "smartdoc.workflow.run",
+                    attributes={
+                        "smartdoc.question.length": len(question_text.strip()),
+                        "smartdoc.cached_retriever": used_cached_retriever,
+                        "smartdoc.provider.llm": parameters.LLM_PROVIDER,
+                    },
+                ) as workflow_span:
+                    try:
+                        result = orchestrator.run_workflow(question=question_text, retriever=retriever)
+                    except Exception as workflow_error:
+                        mark_span_error(workflow_span, workflow_error)
+                        raise
                 answer = result["draft_answer"]
+                logger.info(
+                    "[ANSWER_LOG] delivered_answer | question=%s | chars=%d\n%s",
+                    question_text[:200],
+                    len((answer or "").strip()),
+                    (answer or "").strip(),
+                )
                 # Stage 5: Verifying Answer
                 yield (
                     chat_history,
@@ -817,13 +1006,28 @@ setInterval(tick, 500);
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
                 )
                 verification = result.get("verification_report", "No verification details available.")
                 logger.info(f"Verification (internal):\n{verification}")
                 # Do not display verification to user, only use internally
+                
+                # Log successful question answering
+                analytics_logger.log_question(
+                    ip_address=ip_address,
+                    question=question_text,
+                    num_files=len(uploaded_files),
+                    file_types=file_types,
+                    success=True
+                )
+                metric_attrs["cached_retriever"] = used_cached_retriever
+                record_request_metrics(
+                    duration_s=time.perf_counter() - run_started_at,
+                    success=True,
+                    extra_attributes=metric_attrs,
+                )
            
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"**Answer:**\n{answer}"})
@@ -832,12 +1036,12 @@ setInterval(tick, 500);
                     chat_history,
                     gr.update(visible=True),  # doc_context_display
                     gr.update(visible=True),  # refresh_context_btn
-                    gr.update(interactive=True),
+                    gr.update(interactive=False),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg"></span>
+  <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
                 )      
@@ -853,7 +1057,22 @@ setInterval(tick, 500);
                 )
             except Exception as e:
                 logger.error(f"Processing error: {e}", exc_info=True)
-           
+                
+                # Log failed question
+                analytics_logger.log_question(
+                    ip_address=ip_address,
+                    question=question_text,
+                    num_files=len(uploaded_files) if uploaded_files else 0,
+                    file_types=file_types,
+                    success=False,
+                    error=str(e)
+                )
+                metric_attrs["failure_reason"] = "exception"
+                record_request_metrics(
+                    duration_s=time.perf_counter() - run_started_at,
+                    success=False,
+                    extra_attributes=metric_attrs,
+                )
            
                 chat_history.append({"role": "user", "content": question_text})
                 chat_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
@@ -1141,15 +1360,16 @@ setInterval(tick, 500);
     if is_hf_space:
         # Hugging Face Spaces configuration
         logger.info("Running on Hugging Face Spaces")
-        demo.launch(theme=gr.themes.Soft(), server_name="0.0.0.0", server_port=7860, css=css, js=js)
+        demo.launch(server_name="0.0.0.0", server_port=7860)
     else:
         # Local development configuration
         configured_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
         server_port = _find_open_port(configured_port)
         logger.info(f"Launching Gradio on port {server_port}")
         logger.info(f"Access the app at: http://127.0.0.1:{server_port}")
-        demo.launch(theme=gr.themes.Soft(), server_name="127.0.0.1", server_port=server_port, share=False, css=css, js=js)
+        demo.launch(server_name="127.0.0.1", server_port=server_port, share=False)
 
 
 if __name__ == "__main__":
     main()
+

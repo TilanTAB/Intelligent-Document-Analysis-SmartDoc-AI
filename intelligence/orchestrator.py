@@ -18,7 +18,7 @@ import logging
 from .knowledge_synthesizer import ResearchAgent
 from .accuracy_verifier import VerificationAgent
 from .context_validator import ContextValidator
-from langchain_google_genai import ChatGoogleGenerativeAI
+from core.llm_factory import get_chat_llm
 from configuration.parameters import parameters
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,16 @@ class AgentState(TypedDict, total=False):
     is_relevant: bool
     retriever: BaseRetriever
     feedback: Optional[str]
+    feedback_for_research: Optional[str]
+    contradictions_for_research: List[str]
+    unsupported_claims_for_research: List[str]
     research_attempts: int
     query_used: str
     candidate_answers: List[str]
     selection_reasoning: str
+    should_retry: bool
     is_multi_query: bool
+    subq_idx: int
     sub_queries: List[str]
     sub_results: Annotated[List[SubQResult], operator.add]
 
@@ -59,15 +64,20 @@ class AgentWorkflow:
         self.context_validator = ContextValidator()
         self.compiled_single = None
         self.compiled_main = None
-        self.llm = ChatGoogleGenerativeAI(
-            model=parameters.LLM_MODEL_NAME,
-            google_api_key=parameters.GOOGLE_API_KEY,
+        self.llm = get_chat_llm(
+            role="router",
+            model_name=parameters.LLM_MODEL_NAME,
             temperature=0.1,
-            max_output_tokens=256
+            max_output_tokens=parameters.LLM_ROUTER_MAX_OUTPUT_TOKENS,
         )
         if num_candidates is not None:
             self.NUM_RESEARCH_CANDIDATES = num_candidates
         logger.info(f"AgentWorkflow initialized (candidates={self.NUM_RESEARCH_CANDIDATES})")
+
+    @staticmethod
+    def _log_answer(label: str, answer: str) -> None:
+        text = (answer or "").strip()
+        logger.info("[ANSWER_LOG] %s | chars=%d\n%s", label, len(text), text)
 
     def _retrieve_docs(self, state: AgentState) -> Dict[str, Any]:
         docs = state["retriever"].invoke(state["question"])
@@ -83,6 +93,7 @@ class AgentWorkflow:
             "research_attempts": 0,
             "candidate_answers": [],
             "selection_reasoning": "",
+            "should_retry": False,
             "query_used": state["question"],
         }
 
@@ -136,6 +147,7 @@ class AgentWorkflow:
             f"Q{i+1}: {r['question']}\nA: {r['answer']}"
             for i, r in enumerate(sub_results)
         )
+        self._log_answer("combined_multi_question_answer", combined)
         return {
             "draft_answer": combined,
             "verification_report": "Multi-question answer combined."
@@ -245,6 +257,7 @@ Question: {state['question']}
             "is_multi_query": False,
         }
         final = self.compiled_main.invoke(initial_state)
+        self._log_answer("workflow_final_answer", final.get("draft_answer", ""))
         return {
             "draft_answer": final.get("draft_answer", ""),
             "verification_report": final.get("verification_report", ""),
@@ -261,6 +274,7 @@ Question: {state['question']}
         best_answer = selection_result["selected_answer"]
         selection_reasoning = selection_result.get("reasoning", "")
         logger.info(f"Selected candidate {selection_result['selected_index'] + 1} as best answer")
+        self._log_answer(f"selected_candidate_{selection_result['selected_index'] + 1}", best_answer)
         verification_result = self.verifier.check(
             answer=best_answer,
             documents=state["documents"],
@@ -297,7 +311,7 @@ Question: {state['question']}
         
         # Parallel candidate generation for 2× speedup
         import concurrent.futures
-        candidate_answers = []
+        candidate_answers = [""] * self.NUM_RESEARCH_CANDIDATES
         
         def generate_candidate(index):
             logger.info(f"Generating candidate {index + 1}/{self.NUM_RESEARCH_CANDIDATES}")
@@ -311,17 +325,33 @@ Question: {state['question']}
         
         # Use ThreadPoolExecutor for parallel LLM API calls (I/O-bound)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.NUM_RESEARCH_CANDIDATES) as executor:
-            futures = [executor.submit(generate_candidate, i) for i in range(self.NUM_RESEARCH_CANDIDATES)]
-            for future in concurrent.futures.as_completed(futures):
+            future_to_idx = {
+                executor.submit(generate_candidate, i): i
+                for i in range(self.NUM_RESEARCH_CANDIDATES)
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    candidate_answers.append(future.result())
+                    candidate_answers[idx] = future.result()
+                    self._log_answer(f"candidate_{idx + 1}_attempt_{attempts}", candidate_answers[idx])
                 except Exception as e:
-                    logger.error(f"Candidate generation failed: {e}")
+                    logger.error(f"Candidate generation failed for candidate {idx + 1}: {e}")
                     # Continue with other candidates even if one fails
-        
-        logger.info(f"Generated {len(candidate_answers)} candidate answers in parallel")
+
+        non_empty_candidates = [answer for answer in candidate_answers if (answer or "").strip()]
+        candidate_lengths = [len((answer or "").strip()) for answer in non_empty_candidates]
+        logger.info(
+            "Generated %d candidate answers in parallel (lengths=%s)",
+            len(non_empty_candidates),
+            candidate_lengths,
+        )
+
+        if not non_empty_candidates:
+            non_empty_candidates = ["No answer could be generated from the current context."]
+            logger.warning("All candidate generations failed or returned empty output; using fallback response.")
+
         return {
-            "candidate_answers": candidate_answers,
+            "candidate_answers": non_empty_candidates,
             "research_attempts": attempts,
             "feedback": None
         }

@@ -1,9 +1,11 @@
 import pickle
 import hashlib
 import logging
+import json
+import re
 import struct  # For handling struct.error exceptions
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,7 +14,12 @@ from configuration.definitions import MAX_TOTAL_SIZE, ALLOWED_TYPES
 import concurrent.futures
 from PIL import Image
 import gc
-from google.genai import types
+from core.vision_client import (
+    get_vision_client,
+    analyze_chart_images,
+    VisionClientUnavailable,
+)
+from core.perf_monitor import latency_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -36,70 +43,386 @@ def detect_chart_on_page(args):
     detection_result = LocalChartDetector.detect_charts(image)
     return (page_num, image, detection_result)
 
+
+def detect_chart_on_page_path(args):
+    """
+    Process-pool-safe chart detection from an on-disk image path.
+
+    Why this exists:
+    - Passing large PIL images through ProcessPool on Windows is memory-heavy and
+      can break worker processes (BrokenProcessPool).
+    - Sending file paths is cheaper and more stable across spawn-based workers.
+    """
+    page_num, image_path = args
+    from pathlib import Path as _Path
+    from PIL import Image as _Image
+    from content_analyzer.visual_detector import LocalChartDetector
+
+    try:
+        with _Image.open(image_path) as img:
+            prepared = preprocess_image(img.convert("RGB"), max_dim=1000)
+            detection_result = LocalChartDetector.detect_charts(prepared)
+        return (page_num, str(image_path), detection_result)
+    except Exception as e:
+        return (
+            page_num,
+            str(image_path),
+            {
+                "has_chart": False,
+                "confidence": 0.0,
+                "chart_types": [],
+                "description": f"Detection failed on {_Path(image_path).name}: {type(e).__name__}",
+                "features": {},
+                "error": str(e),
+            },
+        )
+
+
+def _table_to_markdown_impl(table: List[List], page_num: int, table_idx: int) -> str:
+    """Convert a table (list of rows) to markdown format."""
+    if not table or len(table) < 1:
+        return ""
+
+    cleaned_table: List[List[str]] = []
+    for row in table:
+        if not row:
+            continue
+        cleaned_row: List[str] = []
+        for cell in row:
+            if cell:
+                cell_text = (
+                    str(cell)
+                    .replace("\n", " ")
+                    .replace("\r", " ")
+                    .replace("|", "\\|")
+                    .strip()
+                )
+                cleaned_row.append(cell_text)
+            else:
+                cleaned_row.append("")
+        if any(cleaned_row):
+            cleaned_table.append(cleaned_row)
+
+    if len(cleaned_table) < 1:
+        return ""
+
+    max_cols = max(len(row) for row in cleaned_table)
+    for row in cleaned_table:
+        while len(row) < max_cols:
+            row.append("")
+
+    md_lines = [f"### Table {table_idx} (Page {page_num})"]
+    md_lines.append("| " + " | ".join(cleaned_table[0]) + " |")
+    md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+    for row in cleaned_table[1:]:
+        md_lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(md_lines)
+
+
+def extract_pdf_page_range_payload(
+    args: Tuple[str, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Process a page range from a PDF file in an isolated worker process.
+
+    Returns a payload with:
+    - pages: [{"page_num": int, "tables": list, "text": str}, ...]
+    - text_fallback_success / text_fallback_fail counters.
+    """
+    file_path, page_start, page_end, default_parameters, text_parameters, hybrid_parameters = args
+
+    import pdfplumber
+
+    pages_payload: List[Dict[str, Any]] = []
+    text_fallback_success = 0
+    text_fallback_fail = 0
+    pypdf_reader = None
+    pypdf_unavailable = False
+
+    def _maybe_get_pypdf_reader():
+        nonlocal pypdf_reader, pypdf_unavailable
+        if pypdf_unavailable:
+            return None
+        if pypdf_reader is not None:
+            return pypdf_reader
+        try:
+            from pypdf import PdfReader  # Optional fallback parser
+
+            pypdf_reader = PdfReader(file_path)
+            return pypdf_reader
+        except Exception:
+            pypdf_unavailable = True
+            return None
+
+    with pdfplumber.open(file_path) as pdf:
+        total_pages = len(pdf.pages)
+        safe_start = max(1, int(page_start))
+        safe_end = min(int(page_end), total_pages)
+        for page_num in range(safe_start, safe_end + 1):
+            page_idx = page_num - 1
+            page = pdf.pages[page_idx]
+            page_tables: List[List[List[Any]]] = []
+            table_hashes = set()
+
+            def add_table_if_unique(table) -> bool:
+                if not table or len(table) < 2:
+                    return False
+                table_hash = hash(str(table))
+                if table_hash in table_hashes:
+                    return False
+                table_hashes.add(table_hash)
+                page_tables.append(table)
+                return True
+
+            try:
+                for params in (
+                    default_parameters,
+                    text_parameters,
+                    hybrid_parameters,
+                ):
+                    try:
+                        extracted = page.extract_tables(params) if params else page.extract_tables()
+                        if extracted:
+                            for table in extracted:
+                                add_table_if_unique(table)
+                    except struct.error:
+                        continue
+                    except Exception:
+                        continue
+
+                try:
+                    found_tables = page.find_tables(text_parameters)
+                    if found_tables:
+                        for ft in found_tables:
+                            table = ft.extract()
+                            add_table_if_unique(table)
+                except struct.error:
+                    pass
+                except Exception:
+                    pass
+
+                text = ""
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    fallback_reader = _maybe_get_pypdf_reader()
+                    if fallback_reader is not None and page_idx < len(fallback_reader.pages):
+                        try:
+                            fallback_text = fallback_reader.pages[page_idx].extract_text() or ""
+                            if fallback_text.strip():
+                                text = fallback_text
+                                text_fallback_success += 1
+                            else:
+                                text_fallback_fail += 1
+                        except Exception:
+                            text_fallback_fail += 1
+                    else:
+                        text_fallback_fail += 1
+
+                pages_payload.append(
+                    {
+                        "page_num": page_num,
+                        "tables": page_tables,
+                        "text": (text or "").strip(),
+                    }
+                )
+            except Exception:
+                # Skip broken pages in worker and continue others.
+                continue
+
+    return {
+        "pages": pages_payload,
+        "text_fallback_success": text_fallback_success,
+        "text_fallback_fail": text_fallback_fail,
+    }
+
+
+def _parse_chart_analyses(response_text: str, expected_count: int) -> List[str]:
+    """
+    Parse chart-analysis model output robustly.
+
+    Handles:
+    - JSON payloads (preferred)
+    - Markdown code fences containing JSON
+    - Legacy marker format: ---CHART N---
+    - Single-chart plain text fallback
+    """
+    expected = max(1, int(expected_count or 1))
+    text = (response_text or "").strip()
+    if not text:
+        return ["Analysis unavailable (empty response)"] * expected
+
+    def _clean(value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _from_json_payload(payload: object) -> List[str]:
+        items = []
+        if isinstance(payload, dict):
+            for key in ("charts", "results", "items", "data"):
+                candidate = payload.get(key)
+                if isinstance(candidate, list):
+                    items = candidate
+                    break
+            if not items and all(str(k).isdigit() for k in payload.keys()):
+                items = [payload[k] for k in sorted(payload.keys(), key=lambda k: int(k))]
+        elif isinstance(payload, list):
+            items = payload
+
+        analyses: List[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                analysis = ""
+                for field in (
+                    "analysis",
+                    "summary",
+                    "description",
+                    "details",
+                    "content",
+                    "text",
+                ):
+                    analysis = _clean(item.get(field))
+                    if analysis:
+                        break
+                if not analysis:
+                    # Keep a serialized object instead of dropping data silently.
+                    analysis = _clean(json.dumps(item, ensure_ascii=False))
+            else:
+                analysis = _clean(item)
+
+            if analysis:
+                analyses.append(analysis)
+        return analyses
+
+    def _attempt_json_parse(raw_text: str) -> List[str]:
+        candidates: List[str] = []
+        stripped = raw_text.strip()
+        if stripped:
+            candidates.append(stripped)
+
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", raw_text, flags=re.IGNORECASE | re.DOTALL)
+        if fence_match:
+            fenced = fence_match.group(1).strip()
+            if fenced:
+                candidates.append(fenced)
+
+        first_json_start = min(
+            [idx for idx in (raw_text.find("{"), raw_text.find("[")) if idx != -1],
+            default=-1,
+        )
+        if first_json_start != -1:
+            candidates.append(raw_text[first_json_start:].strip())
+
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                payload = json.loads(candidate)
+            except Exception:
+                continue
+
+            analyses = _from_json_payload(payload)
+            if analyses:
+                return analyses
+        return []
+
+    # 1) Preferred: parse JSON.
+    parsed = _attempt_json_parse(text)
+    if parsed:
+        output = parsed[:expected]
+        if len(output) < expected:
+            output.extend(["Analysis unavailable (missing chart section)"] * (expected - len(output)))
+        return output
+
+    # 2) Legacy marker parsing: ---CHART N---
+    marker_pattern = re.compile(r"---\s*CHART\s*(\d+)\s*---", flags=re.IGNORECASE)
+    matches = list(marker_pattern.finditer(text))
+    if matches:
+        sections_by_number = {}
+        for idx, match in enumerate(matches):
+            chart_num = int(match.group(1))
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            section = text[start:end].strip()
+            if section:
+                sections_by_number[chart_num] = section
+
+        if sections_by_number:
+            return [
+                sections_by_number.get(i + 1, "Analysis unavailable (missing chart section)")
+                for i in range(expected)
+            ]
+
+    # 3) Plain text fallback (common when batch size is 1 and model ignores format).
+    if expected == 1:
+        return [text]
+
+    # 4) Multi-chart last resort.
+    return [text] + ["Analysis unavailable (parsing error)"] * (expected - 1)
+
+
 def analyze_batch(batch_tuple):
     """
-    Top-level function for parallel Gemini batch analysis (future-proof for process pools).
+    Top-level function for parallel vision batch analysis.
     """
-    batch, batch_num, total_batches, gemini_client, file_path, parameters, stats = batch_tuple
+    batch, batch_num, total_batches, vision_client, vision_provider, vision_model, file_path, parameters, stats = batch_tuple
     try:
         import logging
         logger = logging.getLogger(__name__)
-        from PIL import Image
-        from google.genai import types
-        images = [Image.open(image_path) for _, image_path, _ in batch]
         prompt = f"""
 Analyze the following {len(batch)} chart(s)/graph(s) in order.
 
-For EACH chart, provide comprehensive analysis separated by the marker "---CHART N---".
+Return JSON ONLY (no markdown or prose wrapper) using this schema:
+{{
+  "charts": [
+    {{
+      "chart_number": 1,
+      "analysis": "..."
+    }}
+  ]
+}}
 
-For each chart include:
-**Chart Type**: [line/bar/pie/bubble/scatter/etc]
-**Title**: [chart title]
-**X-axis**: [label and units]
-**Y-axis**: [label and units]
-**Data Points**: [extract ALL visible data with exact values]
-**Legend**: [list all series/categories]
-**Trends**: [key patterns, trends, insights]
-**Key Values**: [maximum, minimum, significant values]
-**Context**: [any annotations or notes]
-
-Format exactly as:
----CHART 1---
-[analysis]
-
----CHART 2---
-[analysis]
-
----CHART 3---
-[analysis]
+For each chart analysis include:
+- Chart Type
+- Title
+- X-axis
+- Y-axis
+- Data Points (extract visible exact values when possible)
+- Legend
+- Trends
+- Key Values
+- Context
 """
-        # For batch analysis:
-        chart_response = gemini_client.models.generate_content(
-            model=parameters.CHART_VISION_MODEL,
-            contents=[prompt] + images,
-            config=types.GenerateContentConfig(
-                max_output_tokens=parameters.CHART_MAX_TOKENS * len(batch)
-            )
+        response_text = analyze_chart_images(
+            client=vision_client,
+            image_paths=[image_path for _, image_path, _ in batch],
+            prompt=prompt,
+            model_name=vision_model,
+            max_output_tokens=parameters.CHART_MAX_TOKENS * len(batch),
+            provider=vision_provider,
         )
         stats['batch_api_calls'] += 1
-        response_text = chart_response.text
-        parts = response_text.split('---CHART ')
+        analyses = _parse_chart_analyses(response_text=response_text, expected_count=len(batch))
+        unavailable_count = sum(1 for item in analyses if "Analysis unavailable" in (item or ""))
+        if unavailable_count:
+            logger.warning(
+                "Batch %s/%s chart parsing produced %s unavailable section(s). "
+                "response_preview=%s",
+                batch_num,
+                total_batches,
+                unavailable_count,
+                (response_text or "").replace("\n", " ")[:240],
+            )
         batch_docs = []
         for idx, (page_num, image_path, detection_result) in enumerate(batch):
-            if idx + 1 < len(parts):
-                analysis_text = parts[idx + 1]
-                if '---CHART' in analysis_text:
-                    analysis_text = analysis_text.split('---CHART')[0]
-                lines = analysis_text.split('\n')
-                if lines and '---' in lines[0]:
-                    lines = lines[1:]
-                analysis = '\n'.join(lines).strip()
-            else:
-                analysis = "Analysis unavailable (parsing error)"
+            analysis = analyses[idx] if idx < len(analyses) else "Analysis unavailable (parsing error)"
             chart_types_str = ", ".join(detection_result['chart_types']) or "Unknown"
             confidence = detection_result['confidence']
             chart_doc = Document(
-                page_content=f"""### 📊 Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + Gemini Batch Analysis)\n**Local Confidence**: {confidence:.0%}\n**Detected Types**: {chart_types_str}\n**Batch Size**: {len(batch)} charts analyzed together\n\n---\n\n{analysis}\n""",
+                page_content=f"""### 📊 Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + {vision_provider.upper()} Batch Analysis)\n**Local Confidence**: {confidence:.0%}\n**Detected Types**: {chart_types_str}\n**Batch Size**: {len(batch)} charts analyzed together\n\n---\n\n{analysis}\n""",
                 metadata={
                     "source": file_path,
                     "page": page_num,
@@ -110,9 +433,7 @@ Format exactly as:
                 }
             )
             batch_docs.append(chart_doc)
-            stats['charts_analyzed_gemini'] += 1
-        for img in images:
-            img.close()
+            stats['charts_analyzed_vision'] += 1
         logger.info(f"✅ Batch {batch_num} complete ({len(batch)} charts analyzed)")
         return (batch_num - 1, batch_docs)
     except Exception as e:
@@ -124,7 +445,7 @@ class DocumentProcessor:
     """
     Processes documents by splitting them into manageable chunks and caching
     the results to avoid reprocessing. Handles chart extraction using local
-    OpenCV detection and Gemini Vision API with parallelization for speed.
+    OpenCV detection and provider-based vision analysis with parallelization for speed.
     """
     # Cache metadata version - increment when cache format changes
     CACHE_VERSION = 4  # Incremented for chart extraction support
@@ -133,42 +454,61 @@ class DocumentProcessor:
         """Initialize the document processor with cache directory and splitter configuration."""
         self.cache_dir = Path(parameters.CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=parameters.CHUNK_SIZE,
-            chunk_overlap=parameters.CHUNK_OVERLAP,
+        # Content-type-aware splitters (adaptive chunking).
+        self.splitter_text = RecursiveCharacterTextSplitter(
+            chunk_size=max(1, int(parameters.CHUNK_SIZE_TEXT or parameters.CHUNK_SIZE)),
+            chunk_overlap=max(0, int(parameters.CHUNK_OVERLAP_TEXT or parameters.CHUNK_OVERLAP)),
             length_function=len,
             is_separator_regex=False,
         )
-        self.gemini_client = None
-        self.genai_module = None  # Store the module reference
+        self.splitter_table = RecursiveCharacterTextSplitter(
+            chunk_size=max(1, int(parameters.CHUNK_SIZE_TABLE or parameters.CHUNK_SIZE)),
+            chunk_overlap=max(0, int(parameters.CHUNK_OVERLAP_TABLE or parameters.CHUNK_OVERLAP)),
+            length_function=len,
+            is_separator_regex=False,
+        )
+        self.splitter_chart = RecursiveCharacterTextSplitter(
+            chunk_size=max(1, int(parameters.CHUNK_SIZE_CHART or parameters.CHUNK_SIZE)),
+            chunk_overlap=max(0, int(parameters.CHUNK_OVERLAP_CHART or parameters.CHUNK_OVERLAP)),
+            length_function=len,
+            is_separator_regex=False,
+        )
+        # Backward-compatible alias used in older paths.
+        self.splitter = self.splitter_text
+        self.vision_client = None
+        self.vision_provider = parameters.VISION_PROVIDER.lower()
+        self.chart_vision_model = parameters.CHART_VISION_MODEL
+        if self.vision_provider == "azure" and self.chart_vision_model.lower().startswith("gemini"):
+            self.chart_vision_model = parameters.LLM_MODEL_NAME
+            logger.info(
+                f"VISION_PROVIDER=azure with Gemini chart model configured; "
+                f"using {self.chart_vision_model} for chart analysis."
+            )
         # Instance-level flag instead of modifying global parameters
         self.chart_extraction_enabled = parameters.ENABLE_CHART_EXTRACTION
         if self.chart_extraction_enabled:
-            self._init_gemini_vision()
+            self._init_vision_client()
         logger.debug(f"DocumentProcessor initialized with cache dir: {self.cache_dir}")
-        logger.debug(f"Chunk size: {parameters.CHUNK_SIZE}, Chunk overlap: {parameters.CHUNK_OVERLAP}")
+        logger.debug(
+            "Adaptive chunking configured: text=(%s,%s) table=(%s,%s) chart=(%s,%s)",
+            parameters.CHUNK_SIZE_TEXT,
+            parameters.CHUNK_OVERLAP_TEXT,
+            parameters.CHUNK_SIZE_TABLE,
+            parameters.CHUNK_OVERLAP_TABLE,
+            parameters.CHUNK_SIZE_CHART,
+            parameters.CHUNK_OVERLAP_CHART,
+        )
         logger.debug(f"Chart extraction: {'enabled' if self.chart_extraction_enabled else 'disabled'}")
 
-    def _init_gemini_vision(self):
-        """Initialize Gemini Vision client for chart analysis."""
-        genai = None
+    def _init_vision_client(self):
+        """Initialize vision client for chart analysis based on provider."""
         try:
-            # Use the new google.genai package
-            import google.genai as genai
-            logger.debug("✅ Loaded google.genai (new package)")
-        except ImportError as e:
-            logger.warning(f"google-genai not installed: {e}")
-            logger.info("Install with: pip install google-genai")
-            self.chart_extraction_enabled = False  # Instance-level, not global
-            return
-        self.genai_module = genai
-        try:
-            from google import genai
-            self.gemini_client = genai.Client(api_key=parameters.GOOGLE_API_KEY)
-            logger.info(f"✅ Gemini Vision client initialized")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Gemini Vision client: {e}")
-            self.chart_extraction_enabled = False  # Instance-level, not global
+            client = get_vision_client()
+            self.vision_client = client
+            logger.info("✅ Vision client initialized")
+        except VisionClientUnavailable as e:
+            logger.warning(f"Vision client unavailable: {e}")
+            self.chart_extraction_enabled = False
 
     def validate_files(self, files: List) -> bool:
         """
@@ -277,6 +617,48 @@ class DocumentProcessor:
             logger.info(f"Successfully cached {len(chunks)} chunks to {cache_path.name}")
         except Exception as e:
             logger.error(f"Failed to save cache to {cache_path.name}: {e}", exc_info=True)
+
+    def _load_pdf_by_mode(self, file_path: str) -> List[Document]:
+        """
+        Route PDF text extraction.
+
+        Note:
+        - Fast parsing via PyMuPDF was intentionally removed.
+        - We keep PDF_PARSE_MODE values for backward compatibility, but all
+          modes now use the pdfplumber fidelity parser.
+        """
+        mode = parameters.PDF_PARSE_MODE.lower()
+        if mode != "fidelity":
+            logger.warning(
+                "PDF_PARSE_MODE=%s requested, but fast parser support has been removed; "
+                "using fidelity parser (pdfplumber).",
+                mode,
+            )
+        logger.info("[PROFILE] stage=parse.router mode=fidelity")
+        return self._load_pdf_with_pdfplumber(file_path)
+
+    def _select_splitter_for_doc(self, doc: Document) -> RecursiveCharacterTextSplitter:
+        """Choose splitter based on content type."""
+        doc_type = str(doc.metadata.get("type", "text")).lower()
+        if doc_type == "chart":
+            return self.splitter_chart
+        if doc_type == "table":
+            return self.splitter_table
+        return self.splitter_text
+
+    def _normalize_chunk_text(self, text: str, doc_type: str) -> str:
+        """
+        Normalize chunk text for dedupe/storage efficiency.
+
+        - Optional whitespace compression for text/table chunks.
+        - Chart chunks keep line breaks to preserve structure cues.
+        """
+        normalized = (text or "").strip()
+        if not normalized:
+            return ""
+        if parameters.PRE_INGEST_COMPRESS_WHITESPACE and doc_type != "chart":
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
     
     def _process_file(self, file) -> List[Document]:
         file_ext = Path(file.name).suffix.lower()
@@ -287,22 +669,34 @@ class DocumentProcessor:
             documents = []
             if file_ext == '.pdf':
                 import concurrent.futures
-                results = {}
-                def run_pdfplumber():
-                    return self._load_pdf_with_pdfplumber(file.name)
+                def run_text_parse():
+                    t_parse_start = datetime.now().timestamp()
+                    docs = self._load_pdf_by_mode(file.name)
+                    t_parse_end = datetime.now().timestamp()
+                    parse_duration = t_parse_end - t_parse_start
+                    logger.info(f"[PROFILE] stage=parse.total duration_s={parse_duration:.3f} file={Path(file.name).name}")
+                    latency_monitor.record(
+                        stage="parse.total",
+                        duration_s=parse_duration,
+                        metadata={"file": Path(file.name).name},
+                    )
+                    return docs
                 def run_charts():
-                    logger.info(f"chart_extraction_enabled={self.chart_extraction_enabled}, gemini_client={self.gemini_client is not None}")
-                    if self.chart_extraction_enabled and self.gemini_client:
+                    logger.info(
+                        f"chart_extraction_enabled={self.chart_extraction_enabled}, "
+                        f"vision_client={self.vision_client is not None}, provider={self.vision_provider}"
+                    )
+                    if self.chart_extraction_enabled and self.vision_client:
                         return self._extract_charts_from_pdf(file.name)
                     return []
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                        future_pdf = executor.submit(run_pdfplumber)
+                        future_pdf = executor.submit(run_text_parse)
                         future_charts = executor.submit(run_charts)
                         try:
                             docs = future_pdf.result()
                         except MemoryError as e:
-                            logger.error(f"Out of memory in PDFPlumber thread: {e}. Falling back to sequential.")
+                            logger.error(f"Out of memory in text parsing thread: {e}. Falling back to fidelity parser.")
                             docs = self._load_pdf_with_pdfplumber(file.name)
                         try:
                             chart_docs = future_charts.result()
@@ -315,8 +709,8 @@ class DocumentProcessor:
                             logger.info(f"📊 Added {len(chart_docs)} chart descriptions to {file.name}")
                 except MemoryError as e:
                     logger.error(f"Out of memory in parallel PDF processing: {e}. Falling back to sequential.")
-                    documents = self._load_pdf_with_pdfplumber(file.name)
-                    if self.chart_extraction_enabled and self.gemini_client:
+                    documents = self._load_pdf_by_mode(file.name)
+                    if self.chart_extraction_enabled and self.vision_client:
                         chart_docs = self._extract_charts_from_pdf(file.name)
                         if chart_docs:
                             documents.extend(chart_docs)
@@ -342,19 +736,35 @@ class DocumentProcessor:
                 logger.warning(f"No content extracted from {file.name}")
                 return []
             all_chunks = []
-            total_docs = len(documents)
             # --- STABLE FILE HASHING ---
             with open(file.name, 'rb') as f:
                 file_bytes = f.read()
             file_hash = self._generate_hash(file_bytes)  # Stable hash by file content
             stable_source = f"{Path(file.name).name}::{file_hash}"
+            t_chunk_start = datetime.now().timestamp()
+            seen_chunk_hashes = set()
+            dropped_tiny = 0
+            dropped_dupes = 0
             for i, doc in enumerate(documents):
-                page_chunks = self.splitter.split_text(doc.page_content)
-                total_chunks = len(page_chunks)
+                doc_type = str(doc.metadata.get("type", "text")).lower()
+                splitter = self._select_splitter_for_doc(doc)
+                page_chunks = splitter.split_text(doc.page_content)
                 for j, chunk in enumerate(page_chunks):
+                    normalized_chunk = self._normalize_chunk_text(chunk, doc_type=doc_type)
+                    if len(normalized_chunk) < max(0, int(parameters.PRE_INGEST_MIN_CHUNK_CHARS)):
+                        dropped_tiny += 1
+                        continue
+
+                    if parameters.PRE_INGEST_DEDUPE_ENABLED:
+                        chunk_hash = hashlib.sha256(normalized_chunk.encode("utf-8")).hexdigest()
+                        if chunk_hash in seen_chunk_hashes:
+                            dropped_dupes += 1
+                            continue
+                        seen_chunk_hashes.add(chunk_hash)
+
                     chunk_id = f"txt_{file_hash}_{doc.metadata.get('page', i + 1)}_{j}"
                     chunk_doc = Document(
-                        page_content=chunk,
+                        page_content=normalized_chunk,
                         metadata={
                             "source": stable_source,                            
                             "page": doc.metadata.get("page", i + 1),
@@ -363,6 +773,15 @@ class DocumentProcessor:
                         }
                     )
                     all_chunks.append(chunk_doc)
+            t_chunk_end = datetime.now().timestamp()
+            logger.info(f"[PROFILE] stage=chunking.total duration_s={t_chunk_end - t_chunk_start:.3f} chunks={len(all_chunks)}")
+            if dropped_tiny or dropped_dupes:
+                logger.info(
+                    "[PROFILE] stage=chunking.optimization dropped_tiny=%d dropped_dupes=%d kept=%d",
+                    dropped_tiny,
+                    dropped_dupes,
+                    len(all_chunks),
+                )
                  
             logger.info(f"Processed {file.name}: {len(documents)} page(s) → {len(all_chunks)} chunk(s)")
             return all_chunks
@@ -377,7 +796,7 @@ class DocumentProcessor:
         """
         Extract and analyze charts/graphs from PDF with true batch processing and parallelism.
         PHASE 1: Parallel local chart detection (CPU-bound, uses ProcessPoolExecutor)
-        PHASE 2: Parallel Gemini batch analysis (I/O-bound, uses ThreadPoolExecutor)
+        PHASE 2: Parallel vision batch analysis (I/O-bound, uses ThreadPoolExecutor)
         """
         file_bytes = Path(file_path).read_bytes()
         file_hash = self._generate_hash(file_bytes)
@@ -409,14 +828,14 @@ class DocumentProcessor:
                     from content_analyzer.visual_detector import LocalChartDetector
                     logger.info(f"📊 [BATCH MODE] Local detection → Temp cache → Batch analysis")
                 except ImportError:
-                    logger.warning("Local chart detector not available, falling back to Gemini")
+                    logger.warning("Local chart detector not available, falling back to vision model")
                     use_local = False
             
             # Track statistics
             stats = {
                 'pages_scanned': 0,
                 'charts_detected_local': 0,
-                'charts_analyzed_gemini': 0,
+                'charts_analyzed_vision': 0,
                 'api_calls_saved': 0,
                 'batch_api_calls': 0
             }
@@ -434,117 +853,207 @@ class DocumentProcessor:
             try:
                 # === PHASE 1: PARALLEL LOCAL CHART DETECTION (CPU-BOUND) ===
                 logger.info("Phase 1: Detecting charts and caching to disk...")
-                batch_size = parameters.CHART_BATCH_SIZE
-                
-                detected_charts = []
-                if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
-                    logger.info("Parallel local chart detection using ProcessPoolExecutor...")
-                    # Use optimal worker count: min of CPU count or 4 to avoid memory issues
-                    import os
-                    max_workers = min(os.cpu_count() or 2, 4)
-                    logger.info(f"Using {max_workers} workers for parallel chart detection")
-                    
-                    # MEMORY OPTIMIZATION: Process pages in streaming batches instead of loading all at once
-                    # This reduces peak memory by 60-80% for large PDFs
-                    detection_batch_size = 20  # Process 20 pages at a time to limit memory
-                    
-                    for batch_start in range(1, total_pages + 1, detection_batch_size):
-                        batch_end = min(batch_start + detection_batch_size - 1, total_pages)
-                        logger.debug(f"Processing detection batch: pages {batch_start}-{batch_end}")
-                        
-                        # Load only this batch of pages into memory
-                        page_image_tuples = []
-                        try:
-                            images = convert_from_path(
-                                file_path,
-                                dpi=parameters.CHART_DPI,
-                                first_page=batch_start,
-                                last_page=batch_end,
-                                fmt='jpeg',
-                                jpegopt={'quality': 85, 'optimize': True}
-                            )
-                            for idx, image in enumerate(images):
-                                page_num = batch_start + idx
-                                stats['pages_scanned'] += 1
-                                # Resize if needed
+                phase1_start = datetime.now().timestamp()
+                detection_batch_size = 20  # stream pages to keep memory bounded
+
+                def _safe_delete(path: str) -> None:
+                    try:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                    except Exception:
+                        logger.debug(f"Could not delete temporary image: {path}")
+
+                def _load_page_images_as_paths(batch_start: int, batch_end: int):
+                    """Convert a PDF page range into on-disk JPEG paths."""
+                    page_tasks = []
+                    try:
+                        # Preferred path: let pdf2image write files directly to disk.
+                        image_paths = convert_from_path(
+                            file_path,
+                            dpi=parameters.CHART_DPI,
+                            first_page=batch_start,
+                            last_page=batch_end,
+                            fmt='jpeg',
+                            output_folder=temp_dir,
+                            paths_only=True,
+                            jpegopt={'quality': 85, 'optimize': True},
+                        )
+                        for idx, image_path in enumerate(image_paths):
+                            page_num = batch_start + idx
+                            stats['pages_scanned'] += 1
+                            page_tasks.append((page_num, str(image_path)))
+                        return page_tasks
+                    except TypeError:
+                        # Compatibility path for older pdf2image versions without paths_only.
+                        images = convert_from_path(
+                            file_path,
+                            dpi=parameters.CHART_DPI,
+                            first_page=batch_start,
+                            last_page=batch_end,
+                            fmt='jpeg',
+                            jpegopt={'quality': 85, 'optimize': True},
+                        )
+                        for idx, image in enumerate(images):
+                            page_num = batch_start + idx
+                            stats['pages_scanned'] += 1
+                            try:
                                 max_dimension = parameters.CHART_MAX_IMAGE_SIZE
                                 if max(image.size) > max_dimension:
                                     ratio = max_dimension / max(image.size)
                                     new_size = tuple(int(dim * ratio) for dim in image.size)
                                     image = image.resize(new_size, Image.Resampling.LANCZOS)
-                                page_image_tuples.append((page_num, image))
-                            del images
-                        except Exception as e:
-                            logger.warning(f"Failed to process pages {batch_start}-{batch_end}: {e}")
-                            continue
-                        
-                        # Process this batch with parallel detection
-                        if page_image_tuples:
-                            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                                results = list(executor.map(detect_chart_on_page, page_image_tuples))
-                            
-                            # Process detection results and save charts to disk
-                            for page_num, image, detection_result in results:
-                                if not detection_result['has_chart']:
-                                    logger.debug(f"Page {page_num}: No chart detected (skipping)")
-                                    stats['api_calls_saved'] += 1
-                                    continue
-                                confidence = detection_result['confidence']
-                                if confidence < parameters.CHART_MIN_CONFIDENCE:
-                                    logger.debug(f"Page {page_num}: Low confidence ({confidence:.0%}), skipping")
-                                    stats['api_calls_saved'] += 1
-                                    continue
-                                logger.info(f"📈 Chart detected on page {page_num} (confidence: {confidence:.0%})")
-                                stats['charts_detected_local'] += 1
-                                image_path = os.path.join(temp_dir, f'chart_page_{page_num}.jpg')
-                                image.save(image_path, 'JPEG', quality=90)
-                                detected_charts.append((page_num, image_path, detection_result))
-                                # Release memory immediately
-                                del image
-                            
+                                image_path = os.path.join(temp_dir, f'page_{page_num}.jpg')
+                                image.save(image_path, 'JPEG', quality=85)
+                                page_tasks.append((page_num, image_path))
+                            finally:
+                                try:
+                                    image.close()
+                                except Exception:
+                                    pass
+                        del images
+                        return page_tasks
 
-                            # Clean up batch memory
-                            del page_image_tuples
-                            del results
-                            gc.collect()
-                            logger.debug(f"Batch {batch_start}-{batch_end} complete, memory released")
+                def _store_detected_chart(page_num: int, page_image_path: str, detection_result: dict) -> None:
+                    has_chart = bool(detection_result.get("has_chart"))
+                    confidence = float(detection_result.get("confidence", 0.0) or 0.0)
+                    if not has_chart:
+                        logger.debug(f"Page {page_num}: No chart detected (skipping)")
+                        stats['api_calls_saved'] += 1
+                        _safe_delete(page_image_path)
+                        return
+                    if confidence < parameters.CHART_MIN_CONFIDENCE:
+                        logger.debug(f"Page {page_num}: Low confidence ({confidence:.0%}), skipping")
+                        stats['api_calls_saved'] += 1
+                        _safe_delete(page_image_path)
+                        return
+
+                    logger.info(f"📈 Chart detected on page {page_num} (confidence: {confidence:.0%})")
+                    stats['charts_detected_local'] += 1
+
+                    chart_path = os.path.join(temp_dir, f'chart_page_{page_num}.jpg')
+                    source_path = str(page_image_path)
+                    if os.path.abspath(source_path) != os.path.abspath(chart_path):
+                        try:
+                            os.replace(source_path, chart_path)
+                        except Exception:
+                            # Best-effort fallback: keep original path if rename fails.
+                            chart_path = source_path
+                    detected_charts.append((page_num, chart_path, detection_result))
+
+                detected_charts = []
+                if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
+                    max_workers = min(os.cpu_count() or 2, 4)
+                    logger.info(
+                        "Parallel local chart detection using ProcessPoolExecutor "
+                        f"(workers={max_workers}) with automatic fallback to threads"
+                    )
+                    process_pool_available = True
+
+                    for batch_start in range(1, total_pages + 1, detection_batch_size):
+                        batch_end = min(batch_start + detection_batch_size - 1, total_pages)
+                        logger.debug(f"Processing detection batch: pages {batch_start}-{batch_end}")
+
+                        try:
+                            page_image_tuples = _load_page_images_as_paths(batch_start, batch_end)
+                        except Exception as e:
+                            logger.warning(f"Failed to render pages {batch_start}-{batch_end}: {e}")
+                            continue
+
+                        if not page_image_tuples:
+                            continue
+
+                        results = []
+                        if process_pool_available:
+                            try:
+                                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                                    results = list(executor.map(detect_chart_on_page_path, page_image_tuples))
+                            except Exception as e:
+                                process_pool_available = False
+                                logger.warning(
+                                    "ProcessPool chart detection failed on pages %s-%s (%s). "
+                                    "Switching to ThreadPool fallback for remaining batches.",
+                                    batch_start,
+                                    batch_end,
+                                    e,
+                                )
+
+                        if not results:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                                results = list(executor.map(detect_chart_on_page_path, page_image_tuples))
+
+                        for page_num, page_image_path, detection_result in results:
+                            _store_detected_chart(
+                                page_num=page_num,
+                                page_image_path=page_image_path,
+                                detection_result=detection_result or {},
+                            )
+
+                        del page_image_tuples
+                        del results
+                        gc.collect()
+                        logger.debug(f"Batch {batch_start}-{batch_end} complete, memory released")
+                elif use_local:
+                    logger.info("Using sequential local chart detection fallback...")
+                    for batch_start in range(1, total_pages + 1, detection_batch_size):
+                        batch_end = min(batch_start + detection_batch_size - 1, total_pages)
+                        logger.debug(f"Sequential detection batch: pages {batch_start}-{batch_end}")
+
+                        try:
+                            page_image_tuples = _load_page_images_as_paths(batch_start, batch_end)
+                        except Exception as e:
+                            logger.warning(f"Failed to render pages {batch_start}-{batch_end}: {e}")
+                            continue
+
+                        for args in page_image_tuples:
+                            page_num, page_image_path, detection_result = detect_chart_on_page_path(args)
+                            _store_detected_chart(
+                                page_num=page_num,
+                                page_image_path=page_image_path,
+                                detection_result=detection_result or {},
+                            )
+
+                        del page_image_tuples
+                        gc.collect()
                 else:
-                    # Fallback: sequential detection
-                    for page_num, image in page_image_tuples:
-                        if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
-                            detection_result = LocalChartDetector.detect_charts(image)
-                            if not detection_result['has_chart']:
-                                logger.debug(f"Page {page_num}: No chart detected (skipping)")
-                                stats['api_calls_saved'] += 1
-                                continue
-                            confidence = detection_result['confidence']
-                            if confidence < parameters.CHART_MIN_CONFIDENCE:
-                                logger.debug(f"Page {page_num}: Low confidence ({confidence:.0%}), skipping")
-                                stats['api_calls_saved'] += 1
-                                continue
-                            logger.info(f"📈 Chart detected on page {page_num} (confidence: {confidence:.0%})")
-                            stats['charts_detected_local'] += 1
-                            image_path = os.path.join(temp_dir, f'chart_page_{page_num}.jpg')
-                            image.save(image_path, 'JPEG', quality=90)
-                            detected_charts.append((page_num, image_path, detection_result))
+                    logger.info(
+                        "Local chart detection disabled (CHART_USE_LOCAL_DETECTION=false); "
+                        "skipping Phase 1 detections."
+                    )
 
                 logger.info(f"Phase 1 complete: {len(detected_charts)} charts detected and cached")
+                phase1_duration = datetime.now().timestamp() - phase1_start
+                latency_monitor.record(
+                    stage="chart.phase1",
+                    duration_s=phase1_duration,
+                    metadata={"pages": total_pages, "detected_charts": len(detected_charts)},
+                )
                 
-                # === PHASE 2: PARALLEL GEMINI BATCH ANALYSIS (I/O-BOUND) ===
-                if not detected_charts or not self.gemini_client:
+                # === PHASE 2: PARALLEL VISION BATCH ANALYSIS (I/O-BOUND) ===
+                if not detected_charts or not self.vision_client:
                     return []
                 
                 logger.info(f"Phase 2: Batch analyzing {len(detected_charts)} charts...")
+                phase2_start = datetime.now().timestamp()
                 chart_documents = []
                 
                 if parameters.CHART_ENABLE_BATCH_ANALYSIS and len(detected_charts) > 1:
-                    # Batch processing with parallel Gemini API calls
-                    gemini_batch_size = parameters.CHART_GEMINI_BATCH_SIZE
-                    batches = [detected_charts[i:i + gemini_batch_size] for i in range(0, len(detected_charts), gemini_batch_size)]
+                    # Batch processing with parallel vision API calls
+                    vision_batch_size = parameters.CHART_GEMINI_BATCH_SIZE
+                    batches = [detected_charts[i:i + vision_batch_size] for i in range(0, len(detected_charts), vision_batch_size)]
 
                     # Prepare batch tuples with batch_num and total_batches
                     batch_tuples = [
-                        (batch, idx + 1, len(batches), self.gemini_client, file_path, parameters, stats)
+                        (
+                            batch,
+                            idx + 1,
+                            len(batches),
+                            self.vision_client,
+                            self.vision_provider,
+                            self.chart_vision_model,
+                            file_path,
+                            parameters,
+                            stats,
+                        )
                         for idx, batch in enumerate(batches)
                     ]
                     results = [None] * len(batches)
@@ -569,7 +1078,6 @@ class DocumentProcessor:
                     # Sequential processing (batch disabled or single chart)
                     for chart_index, (page_num, image_path, detection_result) in enumerate(detected_charts):
                         try:
-                            img = Image.open(image_path)
                             extraction_prompt = """Analyze this chart/graph in comprehensive detail:
                             **Chart Type**: [type]
                             **Title**: [title]
@@ -580,16 +1088,17 @@ class DocumentProcessor:
                             **Key Values**: [max, min, significant]
                             **Context**: [annotations or notes]
                             """
-                            chart_response = self.gemini_client.models.generate_content(
-                                model=parameters.CHART_VISION_MODEL,
-                                contents=[extraction_prompt, img],
-                                config=types.GenerateContentConfig(
-                                    max_output_tokens=parameters.CHART_MAX_TOKENS
-                                )
+                            analysis_text = analyze_chart_images(
+                                client=self.vision_client,
+                                image_paths=[image_path],
+                                prompt=extraction_prompt,
+                                model_name=self.chart_vision_model,
+                                max_output_tokens=parameters.CHART_MAX_TOKENS,
+                                provider=self.vision_provider,
                             )
                             chart_types_str = ", ".join(detection_result['chart_types']) or "Unknown"
                             chart_doc = Document(
-                                page_content=f"""### \U0001F4CA Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + Gemini Sequential)\n**Local Confidence**: {detection_result['confidence']:.0%}\n**Detected Types**: {chart_types_str}\n\n---\n\n{chart_response.text}\n""",
+                                page_content=f"""### \U0001F4CA Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + {self.vision_provider.upper()} Sequential)\n**Local Confidence**: {detection_result['confidence']:.0%}\n**Detected Types**: {chart_types_str}\n\n---\n\n{analysis_text}\n""",
                                 metadata={
                                     "source": file_path,
                                     "page": page_num,
@@ -599,8 +1108,7 @@ class DocumentProcessor:
                                 }
                             )
                             chart_documents.append(chart_doc)
-                            stats['charts_analyzed_gemini'] += 1
-                            img.close()
+                            stats['charts_analyzed_vision'] += 1
                             logger.info(f"✅ Analyzed chart on page {page_num}")
                         except Exception as e:
                             logger.error(f"Failed to analyze page {page_num}: {e}")
@@ -608,10 +1116,10 @@ class DocumentProcessor:
                 # Log statistics
                 if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
                     cost_saved = stats['api_calls_saved'] * 0.0125
-                    actual_cost = stats['batch_api_calls'] * 0.0125 if stats['batch_api_calls'] > 0 else stats['charts_analyzed_gemini'] * 0.0125
+                    actual_cost = stats['batch_api_calls'] * 0.0125 if stats['batch_api_calls'] > 0 else stats['charts_analyzed_vision'] * 0.0125
                     
                     if stats['batch_api_calls'] > 0:
-                        efficiency = stats['charts_analyzed_gemini'] / stats['batch_api_calls']
+                        efficiency = stats['charts_analyzed_vision'] / stats['batch_api_calls']
                     else:
                         efficiency = 1.0
                     
@@ -619,7 +1127,7 @@ class DocumentProcessor:
 📊 Chart Extraction Complete (HYBRID + BATCH MODE):
    Pages scanned: {stats['pages_scanned']}
    Charts detected (local): {stats['charts_detected_local']}
-   Charts analyzed (Gemini): {stats['charts_analyzed_gemini']}
+   Charts analyzed (Vision): {stats['charts_analyzed_vision']}
    Batch API calls: {stats['batch_api_calls']}
    Charts per API call: {efficiency:.1f}
    API calls saved (detection): {stats['api_calls_saved']}
@@ -629,6 +1137,13 @@ class DocumentProcessor:
                 
                 # After chart_documents is created (batch or sequential), deduplicate by title:
                 chart_documents = deduplicate_charts_by_title(chart_documents)
+
+                phase2_duration = datetime.now().timestamp() - phase2_start
+                latency_monitor.record(
+                    stage="chart.phase2",
+                    duration_s=phase2_duration,
+                    metadata={"charts_analyzed": len(chart_documents)},
+                )
                 
                 return chart_documents
             
@@ -658,6 +1173,7 @@ class DocumentProcessor:
         """
         import pdfplumber
         
+        t_start = datetime.now().timestamp()
         logger.info(f"[PDFPLUMBER] Processing: {file_path}")
         file_bytes = Path(file_path).read_bytes()
         file_hash = self._generate_hash(file_bytes)
@@ -687,10 +1203,142 @@ class DocumentProcessor:
             "join_tolerance": 5,
             "min_words_horizontal": 1,
         }
+
+        parse_workers = max(1, int(parameters.PDF_PARSE_PAGE_RANGE_WORKERS or 1))
+        page_range_size = max(1, int(parameters.PDF_PARSE_PAGE_RANGE_SIZE or 24))
+
+        if parse_workers > 1:
+            try:
+                with pdfplumber.open(file_path) as pdf:
+                    total_pages = len(pdf.pages)
+                if total_pages > 1:
+                    logger.info(
+                        "[PDFPLUMBER] Parallel page-range parse enabled (workers=%s, range_size=%s, pages=%s)",
+                        parse_workers,
+                        page_range_size,
+                        total_pages,
+                    )
+
+                    ranges: List[Tuple[int, int]] = []
+                    start = 1
+                    while start <= total_pages:
+                        end = min(total_pages, start + page_range_size - 1)
+                        ranges.append((start, end))
+                        start = end + 1
+
+                    worker_inputs = [
+                        (
+                            file_path,
+                            range_start,
+                            range_end,
+                            default_parameters,
+                            text_parameters,
+                            hybrid_parameters,
+                        )
+                        for range_start, range_end in ranges
+                    ]
+
+                    range_payloads: List[Dict[str, Any]] = []
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=parse_workers) as executor:
+                        futures = [
+                            executor.submit(extract_pdf_page_range_payload, payload)
+                            for payload in worker_inputs
+                        ]
+                        for future in concurrent.futures.as_completed(futures):
+                            range_payloads.append(future.result())
+
+                    pages_payload: List[Dict[str, Any]] = []
+                    text_fallback_success = 0
+                    text_fallback_fail = 0
+                    for payload in range_payloads:
+                        pages_payload.extend(payload.get("pages", []))
+                        text_fallback_success += int(payload.get("text_fallback_success", 0) or 0)
+                        text_fallback_fail += int(payload.get("text_fallback_fail", 0) or 0)
+
+                    pages_payload.sort(key=lambda item: int(item.get("page_num", 0)))
+                    all_content: List[Document] = []
+                    total_tables = 0
+                    for page_payload in pages_payload:
+                        page_num = int(page_payload.get("page_num", 0) or 0)
+                        if page_num < 1:
+                            continue
+                        page_content = [f"## Page {page_num}"]
+                        for table in page_payload.get("tables", []) or []:
+                            total_tables += 1
+                            md_table = self._table_to_markdown(table, page_num, total_tables)
+                            if md_table:
+                                page_content.append(md_table)
+
+                        text = (page_payload.get("text") or "").strip()
+                        if text:
+                            page_content.append(text)
+
+                        if len(page_content) > 1:
+                            combined = "\n\n".join(page_content)
+                            chunk_id = f"txt_{file_hash}_{page_num}_0"
+                            all_content.append(
+                                Document(
+                                    page_content=combined,
+                                    metadata={
+                                        "source": stable_source,
+                                        "page": page_num,
+                                        "loader": "pdfplumber",
+                                        "tables_count": total_tables,
+                                        "type": "text",
+                                        "chunk_id": chunk_id,
+                                    },
+                                )
+                            )
+
+                    t_end = datetime.now().timestamp()
+                    if text_fallback_success or text_fallback_fail:
+                        logger.info(
+                            "[PDFPLUMBER] Text fallback summary: pypdf_success=%s unrecovered=%s",
+                            text_fallback_success,
+                            text_fallback_fail,
+                        )
+                    logger.info(f"[PDFPLUMBER] Extracted {len(all_content)} chunks, {total_tables} tables")
+                    logger.info(
+                        f"[PROFILE] stage=parse.pdfplumber duration_s={t_end - t_start:.3f} "
+                        f"pages={total_pages} docs={len(all_content)} tables={total_tables}"
+                    )
+                    return all_content
+            except Exception as parallel_err:
+                logger.warning(
+                    "[PDFPLUMBER] Parallel page-range parse failed for %s (%s). Falling back to sequential parser.",
+                    file_path,
+                    parallel_err,
+                )
         
         all_content = []
         total_tables = 0
+        text_fallback_success = 0
+        text_fallback_fail = 0
+        pypdf_reader = None
+        pypdf_unavailable_reason = None
+
+        def get_pypdf_reader():
+            nonlocal pypdf_reader, pypdf_unavailable_reason
+            if pypdf_reader is not None:
+                return pypdf_reader
+            if pypdf_unavailable_reason is not None:
+                return None
+            try:
+                from pypdf import PdfReader  # Optional fallback parser
+                pypdf_reader = PdfReader(file_path)
+                logger.debug("[PDFPLUMBER] Enabled pypdf text fallback for problematic pages")
+                return pypdf_reader
+            except Exception as fallback_init_err:
+                pypdf_unavailable_reason = f"{type(fallback_init_err).__name__}: {fallback_init_err}"
+                logger.warning(
+                    "[PDFPLUMBER] pypdf fallback unavailable for %s (%s)",
+                    file_path,
+                    pypdf_unavailable_reason,
+                )
+                return None
+
         with pdfplumber.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
             for page_num, page in enumerate(pdf.pages, 1):
                 page_content = [f"## Page {page_num}"]
                 page_tables = []
@@ -765,12 +1413,48 @@ class DocumentProcessor:
                             page_content.append(md_table)
                 
                     # Extract text
+                    text = ""
                     try:
-                        text = page.extract_text()
-                        if text:
-                            page_content.append(text.strip())
+                        text = page.extract_text() or ""
                     except Exception as e:
-                        logger.warning(f"Text extraction failed on page {page_num}: {e}")
+                        primary_reason = f"{type(e).__name__}: {e}"
+                        fallback_reader = get_pypdf_reader()
+                        if fallback_reader is not None and (page_num - 1) < len(fallback_reader.pages):
+                            try:
+                                fallback_text = fallback_reader.pages[page_num - 1].extract_text() or ""
+                                if fallback_text.strip():
+                                    text = fallback_text
+                                    text_fallback_success += 1
+                                    logger.debug(
+                                        "[PDFPLUMBER] Text fallback used on page %s (%s)",
+                                        page_num,
+                                        primary_reason,
+                                    )
+                                else:
+                                    text_fallback_fail += 1
+                                    logger.warning(
+                                        "Text extraction failed on page %s: %s; pypdf fallback returned empty text",
+                                        page_num,
+                                        primary_reason,
+                                    )
+                            except Exception as fallback_err:
+                                text_fallback_fail += 1
+                                logger.warning(
+                                    "Text extraction failed on page %s: %s; pypdf fallback failed: %s",
+                                    page_num,
+                                    primary_reason,
+                                    fallback_err,
+                                )
+                        else:
+                            text_fallback_fail += 1
+                            logger.warning(
+                                "Text extraction failed on page %s: %s",
+                                page_num,
+                                primary_reason,
+                            )
+
+                    if text:
+                        page_content.append(text.strip())
                     
                     if len(page_content) > 1:
                         combined = "\n\n".join(page_content)
@@ -791,57 +1475,34 @@ class DocumentProcessor:
                     logger.warning(f"Skipping page {page_num} due to error: {e}")
                     continue
         
+        t_end = datetime.now().timestamp()
+        if text_fallback_success or text_fallback_fail:
+            logger.info(
+                "[PDFPLUMBER] Text fallback summary: pypdf_success=%s unrecovered=%s",
+                text_fallback_success,
+                text_fallback_fail,
+            )
         logger.info(f"[PDFPLUMBER] Extracted {len(all_content)} chunks, {total_tables} tables")
+        logger.info(
+            f"[PROFILE] stage=parse.pdfplumber duration_s={t_end - t_start:.3f} "
+            f"pages={total_pages} docs={len(all_content)} tables={total_tables}"
+        )
         return all_content
     
     def _table_to_markdown(self, table: List[List], page_num: int, table_idx: int) -> str:
         """Convert a table (list of rows) to markdown format."""
-        if not table or len(table) < 1:
-            return ""
-        
-        # Clean up cells
-        cleaned_table = []
-        for row in table:
-            if row:
-                cleaned_row = []
-                for cell in row:
-                    if cell:
-                        cell_text = str(cell).replace('\n', ' ').replace('\r', ' ').replace('|', '\\|').strip()
-                        cleaned_row.append(cell_text)
-                    else:
-                        cleaned_row.append("")
-                if any(cleaned_row):
-                    cleaned_table.append(cleaned_row)
-        
-        if len(cleaned_table) < 1:
-            return ""
-        
-        # Determine max columns and pad rows
-        max_cols = max(len(row) for row in cleaned_table)
-        for row in cleaned_table:
-            while len(row) < max_cols:
-                row.append("")
-        
-        # Build markdown table
-        md_lines = [f"### Table {table_idx} (Page {page_num})"]
-        md_lines.append("| " + " | ".join(cleaned_table[0]) + " |")
-        md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
-        
-        for row in cleaned_table[1:]:
-            md_lines.append("| " + " | ".join(row) + " |")
-        
-        return "\n".join(md_lines)                        
+        return _table_to_markdown_impl(table=table, page_num=page_num, table_idx=table_idx)
 
 def run_pdfplumber(file_name):
     from content_analyzer.document_parser import DocumentProcessor
     processor = DocumentProcessor()
     return processor._load_pdf_with_pdfplumber(file_name)
 
-def run_charts(file_name, enable_chart_extraction, gemini_client):
+def run_charts(file_name, enable_chart_extraction, vision_client):
     from content_analyzer.document_parser import DocumentProcessor
     processor = DocumentProcessor()
-    processor.gemini_client = gemini_client
-    if enable_chart_extraction and gemini_client:
+    processor.vision_client = vision_client
+    if enable_chart_extraction and vision_client:
         return processor._extract_charts_from_pdf(file_name)
     return []
 
