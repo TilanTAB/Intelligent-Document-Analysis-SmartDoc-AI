@@ -223,6 +223,11 @@ Optional quality guard input:
 - `tests/` - Test suite
 - `main.py` - Application entry point
 
+## Architecture Diagrams
+- Static markdown (IDE-safe): `docs/architecture.md`
+- Self-contained visual HTML: `docs/architecture_visual.html`
+- Image assets: `docs/diagrams/`
+
 ---
 
 ## Troubleshooting
