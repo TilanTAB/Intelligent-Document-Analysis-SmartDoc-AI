@@ -4,9 +4,8 @@ from configuration.logger_setup import configure_logging
 logger = logging.getLogger(__name__)
 
 import hashlib
-import inspect
 import socket
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple
 import os
 import shutil
 from pathlib import Path
@@ -30,26 +29,29 @@ from core.telemetry import (
 from core.user_analytics import get_analytics_logger
                              
 
-# Rate limiting configuration - 3 requests per hour per IP
-WINDOW_S = 3600
-MAX_CALLS = 5
+# Rate limiting state (configurable via RATE_LIMIT_* settings)
 _calls = defaultdict(deque)  # ip -> timestamps
 _calls_lock = threading.Lock()  # Thread-safe access to rate limit state
 
 def rate_limit(request):
     """Thread-safe rate limiting per IP address."""
+    if not parameters.RATE_LIMIT_ENABLED:
+        return
+
     ip = getattr(request.client, "host", "unknown")
     now = time.time()
+    window_s = int(parameters.RATE_LIMIT_WINDOW_S)
+    max_calls = int(parameters.RATE_LIMIT_MAX_CALLS)
 
     with _calls_lock:
         q = _calls[ip]
         # Remove expired entries
-        while q and (now - q[0]) > WINDOW_S:
+        while q and (now - q[0]) > window_s:
             q.popleft()
     
-        if len(q) >= MAX_CALLS:
+        if len(q) >= max_calls:
             import gradio as gr
-            raise gr.Error(f"Rate limit: {MAX_CALLS} requests per {WINDOW_S//60} minutes. Please wait.")
+            raise gr.Error(f"Rate limit: {max_calls} requests per {window_s//60} minutes. Please wait.")
     
         q.append(now)
 
@@ -67,6 +69,30 @@ EXAMPLES = {
      "Digital Progress and Trends Report 2025": {
         "question": "which country has most Gen Ai patents and which country has most total funding raised by AI start-ups?",
         "file_paths": ["samples/Digital Progress and Trends Report 2025, Strengthening AI Foundations.pdf"]
+    },
+    "NSF Invention 2024 (INV-2)": {
+        "question": "According to Figure INV-2, which foreign inventor location surpassed South Korea in patents granted in 2020?",
+        "file_paths": ["samples/NSF_Invention_Knowledge_Transfer_Innovation_2024.pdf"]
+    },
+    "NSF KTI Industries 2022 (KTI-1)": {
+        "question": "According to Figure KTI-1, which KTI industry increased its share of total KTI value added by more than 12 percentage points?",
+        "file_paths": ["samples/NSF_Production_Trade_KTI_Industries_2022.pdf"]
+    },
+    "NSF R&D Trends 2022 (RD-1)": {
+        "question": "According to Figure RD-1, what were total U.S. R&D amounts in 2019 and the estimated total for 2020?",
+        "file_paths": ["samples/NSF_RnD_Trends_International_Comparisons_2022.pdf"]
+    },
+    "NSF STEM Labor Force 2024 (LBR-1)": {
+        "question": "According to Figure LBR-1, what share of workers with a bachelor's degree or higher are in S&E or S&E-related occupations?",
+        "file_paths": ["samples/NSF_STEM_Labor_Force_2024.pdf"]
+    },
+    "NSF R&D Trends 2024 (RD-1)": {
+        "question": "According to Figure RD-1, what is total U.S. R&D in 2022 and which performer category is largest?",
+        "file_paths": ["samples/NSF_RnD_Trends_International_Comparisons_2024.pdf"]
+    },
+    "NSF KTI Industries 2024 (KTI-1)": {
+        "question": "According to Figure KTI-1, which KTI industry has the largest U.S. nominal value added in 2022?",
+        "file_paths": ["samples/NSF_Production_Trade_KTI_Industries_2024.pdf"]
     }
 }
 
@@ -94,6 +120,46 @@ def format_chat_history(history: List[Dict]) -> str:
 """)
 
     return "\n".join(formatted)
+
+
+def _normalize_chat_messages(chat_history: Any) -> List[Dict[str, str]]:
+    """
+    Normalize chatbot history into Gradio 'messages' format:
+    [{"role": "user|assistant", "content": "..."}]
+    Supports legacy tuple/list pairs for backward compatibility.
+    """
+    normalized: List[Dict[str, str]] = []
+    if not chat_history:
+        return normalized
+
+    for item in chat_history:
+        # New format
+        if isinstance(item, dict) and "role" in item and "content" in item:
+            normalized.append(
+                {
+                    "role": str(item["role"]),
+                    "content": str(item.get("content", "")),
+                }
+            )
+            continue
+
+        # Legacy format: (user, assistant)
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            user_msg, assistant_msg = item
+            if user_msg:
+                normalized.append({"role": "user", "content": str(user_msg)})
+            if assistant_msg:
+                normalized.append({"role": "assistant", "content": str(assistant_msg)})
+
+    return normalized
+
+
+def _append_chat_exchange(chat_history: List[Dict[str, str]], question_text: str, answer_text: str) -> List[Dict[str, str]]:
+    """Append one user+assistant exchange in messages format."""
+    if question_text and question_text.strip():
+        chat_history.append({"role": "user", "content": question_text})
+    chat_history.append({"role": "assistant", "content": answer_text})
+    return chat_history
 
 
 def format_document_context(documents: List, question: str = "") -> str:
@@ -136,6 +202,108 @@ def format_document_context(documents: List, question: str = "") -> str:
         formatted.append(f"\n*... and {len(documents) - 5} more chunks*")
 
     return "\n".join(formatted)
+
+
+def extract_referenced_chart_images(documents: List, max_items: int = 3) -> List[Tuple[str, str]]:
+    """Return unique chart/page image paths (with captions) from retrieved docs."""
+    gallery_items: List[Tuple[str, str]] = []
+    seen_paths = set()
+
+    for doc in documents or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        image_path = metadata.get("chart_image_path")
+        if not image_path:
+            continue
+
+        abs_path = os.path.abspath(str(image_path))
+        if abs_path in seen_paths or not os.path.exists(abs_path):
+            continue
+
+        seen_paths.add(abs_path)
+        page = metadata.get("page", "?")
+        doc_type = str(metadata.get("type", "chart")).lower()
+        source_raw = str(metadata.get("source", "Unknown"))
+        source_name = os.path.basename(source_raw.split("::", 1)[0]) or source_raw
+        caption = f"{source_name} • page {page} • {doc_type}"
+        gallery_items.append((abs_path, caption))
+
+        if len(gallery_items) >= max_items:
+            break
+
+    return gallery_items
+
+
+def question_terms(question: str) -> List[str]:
+    """Extract normalized, non-trivial lexical terms from a question."""
+    if not question:
+        return []
+    stopwords = {
+        "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for", "of", "and", "or",
+        "what", "how", "why", "when", "where", "which", "who", "whom", "whose", "with", "from", "by",
+        "about", "into", "over", "after", "before", "between", "during", "under", "above", "below",
+        "most", "likely", "does", "did", "can", "could", "would", "should",
+    }
+    tokens = re.findall(r"[a-zA-Z0-9']+", question.lower())
+    return [token for token in tokens if len(token) >= 3 and token not in stopwords]
+
+
+def rank_chart_chunks_by_question(question: str, chart_chunks: List) -> List:
+    """Rank chart/page chunks by lexical overlap with the user question."""
+    terms = question_terms(question)
+    if not terms:
+        return []
+
+    scored = []
+    for doc in chart_chunks or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        if not metadata.get("chart_image_path"):
+            continue
+        content = str(getattr(doc, "page_content", "") or "").lower()
+        if not content:
+            continue
+        overlap = sum(1 for term in terms if term in content)
+        if overlap <= 0:
+            continue
+        scored.append((overlap, len(content), doc))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [doc for _, _, doc in scored]
+
+
+def extract_related_chart_images(question: str, chart_chunks: List, max_items: int = 3) -> List[Tuple[str, str]]:
+    """Fallback chart extraction from question-related chart chunks."""
+    ranked_chunks = rank_chart_chunks_by_question(question=question, chart_chunks=chart_chunks)
+    return extract_referenced_chart_images(ranked_chunks, max_items=max_items)
+
+
+def build_chart_gallery_payload(
+    question: str,
+    retrieved_docs: List,
+    chart_chunks: List,
+    max_items: int = 3,
+) -> Tuple[List[Tuple[str, str]], str, str]:
+    """
+    Build gallery payload using strict evidence first, then related-chart fallback.
+    Returns: (gallery_items, note_text, mode)
+    mode ∈ {'direct', 'fallback', 'none'}.
+    """
+    direct_items = extract_referenced_chart_images(retrieved_docs, max_items=max_items)
+    if direct_items:
+        return direct_items, "", "direct"
+
+    fallback_items = extract_related_chart_images(question=question, chart_chunks=chart_chunks, max_items=max_items)
+    if fallback_items:
+        return (
+            fallback_items,
+            "No direct chart evidence in top retrieved chunks; showing related chart pages.",
+            "fallback",
+        )
+
+    return (
+        [],
+        "No chart evidence retrieved for this question. Try asking about a specific figure/chart/table (e.g., 'What does Figure 7 show?').",
+        "none",
+    )
 
 
 def _get_file_hashes(uploaded_files: List) -> frozenset:
@@ -735,12 +903,15 @@ setInterval(tick, 500);
 
         files = gr.Files(label="Upload your files", file_types=definitions.ALLOWED_TYPES)
         question = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
-        # Gradio 6 removed the `type` argument from Chatbot.
-        # Keep compatibility across Gradio versions by probing the signature.
-        chatbot_kwargs = {"label": "Answers", "elem_id": "chat-history"}
-        if "type" in inspect.signature(gr.Chatbot.__init__).parameters:
-            chatbot_kwargs["type"] = "messages"
-        chat = gr.Chatbot(**chatbot_kwargs)
+        chat = gr.Chatbot(label="Answers", elem_id="chat-history")
+        referenced_charts = gr.Gallery(
+            label="Referenced extracted charts/pages",
+            visible=False,
+            columns=3,
+            show_label=True,
+            height="auto",
+        )
+        chart_gallery_note = gr.Markdown("", elem_classes="info-panel", visible=False)
         submit_btn = gr.Button("Get Answer", variant="primary")
         processing_message = gr.HTML("", elem_id="processing-message", visible=False)
         doc_context_display = gr.Markdown("*Submit a question to see which document sections were referenced*", elem_classes="doc-context", visible=False)
@@ -751,6 +922,7 @@ setInterval(tick, 500);
         session_state = gr.State({
             "file_hashes": frozenset(),
             "retriever": None,
+            "chart_chunks": [],
             "chat_history": [],
             "last_documents": [],
             "total_questions": 0,
@@ -776,7 +948,7 @@ setInterval(tick, 500);
                     extra_attributes=metric_attrs,
                 )
                 raise
-            chat_history = chat_history or []
+            chat_history = _normalize_chat_messages(chat_history)
             
             # Get file metadata for logging
             file_types = [Path(f.name).suffix.lower() for f in uploaded_files] if uploaded_files else []
@@ -798,6 +970,8 @@ setInterval(tick, 500);
                 gr.update(interactive=False),
                 gr.update(interactive=False),
                 gr.update(interactive=False),
+                gr.update(value=[], visible=False),
+                gr.update(value="", visible=False),
                 gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -819,8 +993,7 @@ setInterval(tick, 500);
                         success=False,
                         extra_attributes=metric_attrs,
                     )
-                    chat_history.append({"role": "user", "content": question_text})
-                    chat_history.append({"role": "assistant", "content": "Please enter a question."})
+                    chat_history = _append_chat_exchange(chat_history, question_text, "Please enter a question.")
                     yield (
                         chat_history,
                         gr.update(visible=False),
@@ -829,6 +1002,8 @@ setInterval(tick, 500);
                         gr.update(interactive=True),
                         gr.update(interactive=True),
                         gr.update(interactive=True),
+                        gr.update(value=[], visible=False),
+                        gr.update(value="", visible=False),
                         gr.update(value="", visible=False)
                     )
                     return
@@ -847,8 +1022,7 @@ setInterval(tick, 500);
                         success=False,
                         extra_attributes=metric_attrs,
                     )
-                    chat_history.append({"role": "user", "content": question_text})
-                    chat_history.append({"role": "assistant", "content": "Please upload at least one document."})
+                    chat_history = _append_chat_exchange(chat_history, question_text, "Please upload at least one document.")
                     yield (
                         chat_history,
                         gr.update(visible=False),
@@ -857,11 +1031,16 @@ setInterval(tick, 500);
                         gr.update(interactive=True),
                         gr.update(interactive=True),
                         gr.update(interactive=True),
+                        gr.update(value=[], visible=False),
+                        gr.update(value="", visible=False),
                         gr.update(value="", visible=False)
                     )
                     return
                 if not isinstance(session_state.value, dict):
                     session_state.value = {}
+                session_state.value.setdefault("chart_chunks", [])
+                session_state.value.setdefault("last_documents", [])
+                session_state.value.setdefault("chart_chunks_missing_logged", False)
 
                 # Build a stable signature for the current upload set.
                 file_entries = []
@@ -882,6 +1061,14 @@ setInterval(tick, 500);
                     retriever = cached_retriever
                     used_cached_retriever = True
                     logger.info("Using session-cached retriever (file set unchanged).")
+                    if (
+                        not session_state.value.get("chart_chunks")
+                        and not session_state.value.get("chart_chunks_missing_logged")
+                    ):
+                        logger.warning(
+                            "Session-cached retriever has no chart chunk candidates; chart fallback gallery is limited for this request."
+                        )
+                        session_state.value["chart_chunks_missing_logged"] = True
 
                 # Stage 2: Chunking with per-chunk progress and rotating status
                 def load_or_process(file, file_hash):
@@ -924,6 +1111,8 @@ setInterval(tick, 500);
                                 gr.update(interactive=False),
                                 gr.update(interactive=False),
                                 gr.update(interactive=False),
+                                gr.update(value=[], visible=False),
+                                gr.update(value="", visible=False),
                                 gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -938,6 +1127,8 @@ setInterval(tick, 500);
                         gr.update(interactive=False),
                         gr.update(interactive=False),
                         gr.update(interactive=False),
+                        gr.update(value=[], visible=False),
+                        gr.update(value="", visible=False),
                         gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -952,6 +1143,8 @@ setInterval(tick, 500);
                         gr.update(interactive=False),
                         gr.update(interactive=False),
                         gr.update(interactive=False),
+                        gr.update(value=[], visible=False),
+                        gr.update(value="", visible=False),
                         gr.update(value=(
                             '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
                             '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
@@ -962,6 +1155,12 @@ setInterval(tick, 500);
                     retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
                     session_state.value["retriever"] = retriever
                     session_state.value["file_hashes"] = current_file_hashes
+                    session_state.value["chart_chunks"] = [
+                        chunk
+                        for chunk in all_chunks
+                        if (getattr(chunk, "metadata", {}) or {}).get("chart_image_path")
+                    ]
+                    session_state.value["chart_chunks_missing_logged"] = False
                 # Stage 4: Generating Answer
                 yield (
                     chat_history,
@@ -971,6 +1170,8 @@ setInterval(tick, 500);
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
+                    gr.update(value=[], visible=False),
+                    gr.update(value="", visible=False),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -1005,6 +1206,8 @@ setInterval(tick, 500);
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
+                    gr.update(value=[], visible=False),
+                    gr.update(value="", visible=False),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -1029,9 +1232,26 @@ setInterval(tick, 500);
                     extra_attributes=metric_attrs,
                 )
            
-                chat_history.append({"role": "user", "content": question_text})
-                chat_history.append({"role": "assistant", "content": f"**Answer:**\n{answer}"})
-                session_state.value["last_documents"] = retriever.invoke(question_text)
+                chat_history = _append_chat_exchange(chat_history, question_text, f"**Answer:**\n{answer}")
+                retrieved_docs = retriever.invoke(question_text)
+                session_state.value["last_documents"] = retrieved_docs
+                chart_chunks = session_state.value.get("chart_chunks") or []
+                chart_gallery_items, chart_gallery_note_text, chart_gallery_mode = build_chart_gallery_payload(
+                    question=question_text,
+                    retrieved_docs=retrieved_docs,
+                    chart_chunks=chart_chunks,
+                    max_items=3,
+                )
+                direct_count = len(chart_gallery_items) if chart_gallery_mode == "direct" else 0
+                fallback_count = len(chart_gallery_items) if chart_gallery_mode == "fallback" else 0
+                logger.info(
+                    "[CHART_GALLERY] mode=%s direct_count=%d fallback_count=%d selected_count=%d chart_candidates=%d",
+                    chart_gallery_mode,
+                    direct_count,
+                    fallback_count,
+                    len(chart_gallery_items),
+                    len(chart_chunks),
+                )
                 yield (
                     chat_history,
                     gr.update(visible=True),  # doc_context_display
@@ -1040,6 +1260,8 @@ setInterval(tick, 500);
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
+                    gr.update(value=chart_gallery_items, visible=bool(chart_gallery_items)),
+                    gr.update(value=chart_gallery_note_text, visible=bool(chart_gallery_note_text)),
                     gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
@@ -1053,6 +1275,8 @@ setInterval(tick, 500);
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
+                    gr.update(value=chart_gallery_items, visible=bool(chart_gallery_items)),
+                    gr.update(value=chart_gallery_note_text, visible=bool(chart_gallery_note_text)),
                     gr.update(value="", visible=False)
                 )
             except Exception as e:
@@ -1074,8 +1298,7 @@ setInterval(tick, 500);
                     extra_attributes=metric_attrs,
                 )
            
-                chat_history.append({"role": "user", "content": question_text})
-                chat_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
+                chat_history = _append_chat_exchange(chat_history, question_text, f"Error: {str(e)}")
                 yield (
                     chat_history,
                     gr.update(visible=False),
@@ -1084,13 +1307,15 @@ setInterval(tick, 500);
                     gr.update(interactive=True),
                     gr.update(interactive=True),
                     gr.update(interactive=True),
+                    gr.update(value=[], visible=False),
+                    gr.update(value="", visible=False),
                     gr.update(value="", visible=False)
                 )
 
         submit_btn.click(
             fn=process_question,
             inputs=[question, files, chat],
-            outputs=[chat, doc_context_display, refresh_context_btn, submit_btn, question, files, example_dropdown, processing_message],
+            outputs=[chat, doc_context_display, refresh_context_btn, submit_btn, question, files, example_dropdown, referenced_charts, chart_gallery_note, processing_message],
             queue=True,
             show_progress=True
         )
@@ -1099,9 +1324,18 @@ setInterval(tick, 500);
             docs = session_state.value.get("last_documents", [])
             last_question = ""
             for msg in reversed(chat.value or []):
-                if msg["role"] == "user":
-                    last_question = msg["content"]
-                    break
+                if isinstance(msg, (list, tuple)) and len(msg) >= 1:
+                    last_question = msg[0] or ""
+                    if last_question:
+                        break
+                elif isinstance(msg, dict) and msg.get("role") == "user":
+                    last_question = msg.get("content", "")
+                    if last_question:
+                        break
+                elif getattr(msg, "role", None) == "user":
+                    last_question = getattr(msg, "content", "") or ""
+                    if last_question:
+                        break
             return format_document_context(docs, last_question)
 
         refresh_context_btn.click(

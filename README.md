@@ -66,6 +66,25 @@ If you’re interested in architecture tradeoffs (cost, latency, memory limits, 
 
 ---
 
+## What’s New: Chart Evidence Gallery
+
+SmartDoc now shows up to **top 3 referenced chart/page images below the answer** when available.
+
+- **Direct mode**: chart images come directly from top retrieved evidence chunks.
+- **Fallback mode**: if top chunks have no chart images, SmartDoc finds related chart chunks by lexical overlap and shows those images.
+- **None mode**: when no relevant chart evidence is available, SmartDoc shows an explicit note (instead of silently showing nothing).
+
+### Direct evidence example
+![Chart gallery direct mode](docs/screenshots/chart-gallery-direct.png)
+
+### Related-chart fallback example
+![Chart gallery fallback mode](docs/screenshots/chart-gallery-fallback.png)
+
+### No-chart-evidence example
+![Chart gallery none mode](docs/screenshots/chart-gallery-none.png)
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -211,6 +230,35 @@ python scripts/compare_benchmarks.py --baseline docs/perf/benchmarks/<baseline>.
 Optional quality guard input:
 - `--quality-queries path/to/queries.json`
 - Format: `[{"question":"...", "expected_sources":["source-fragment"]}]`
+
+### Performance Improvements (Latest Recheck)
+
+Source files:
+- Baseline: `docs/perf/benchmarks/20260214T044923Z_bottleneck_example.json`
+- Recheck: `docs/perf/benchmarks/20260224T121039Z_quick_recheck_20260224.json`
+
+| Stage (p95) | Baseline (s) | Recheck (s) | Change |
+|---|---:|---:|---:|
+| Parse | 97.350 | 72.043 | **-26.0%** |
+| Retriever build | 118.021 | 99.632 | **-15.6%** |
+| Ingest build (end-to-end) | 215.416 | 171.720 | **-20.3%** |
+| Query | 0.365 | 0.695 | **+90.6%** |
+
+> Note: query latency is workload-sensitive (retrieval mix, context length, and model behavior), so evaluate p95 over multiple runs before drawing conclusions.
+
+### Security guardrail before commit
+
+Run the staged-content scanner to block real API keys / real endpoint URLs:
+
+```bash
+python scripts/check_staged_secrets.py
+```
+
+### Regenerate README screenshots
+
+```bash
+python scripts/capture_readme_screenshots.py
+```
 
 ---
 

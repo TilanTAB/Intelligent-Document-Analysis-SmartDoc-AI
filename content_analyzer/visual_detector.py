@@ -13,6 +13,27 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+
+def _runtime_detector_config() -> Dict[str, Any]:
+    """Read runtime OpenCV detection knobs from settings with safe fallbacks."""
+    defaults = {
+        "max_detect_dim": 700,
+        "fast_mode": True,
+        "min_lines_for_circles": 20,
+        "min_diag_lines_for_circles": 2,
+    }
+    try:
+        from configuration.parameters import parameters
+
+        return {
+            "max_detect_dim": max(256, int(getattr(parameters, "CHART_OPENCV_MAX_DIM", defaults["max_detect_dim"]) or defaults["max_detect_dim"])),
+            "fast_mode": bool(getattr(parameters, "CHART_OPENCV_FAST_MODE", defaults["fast_mode"])),
+            "min_lines_for_circles": max(1, int(getattr(parameters, "CHART_OPENCV_MIN_LINES_FOR_CIRCLES", defaults["min_lines_for_circles"]) or defaults["min_lines_for_circles"])),
+            "min_diag_lines_for_circles": max(1, int(getattr(parameters, "CHART_OPENCV_MIN_DIAG_LINES_FOR_CIRCLES", defaults["min_diag_lines_for_circles"]) or defaults["min_diag_lines_for_circles"])),
+        }
+    except Exception:
+        return defaults
+
 class LocalChartDetector:
     """
     Detects charts in images using OpenCV - completely free, no API calls.
@@ -44,6 +65,7 @@ class LocalChartDetector:
             import cv2
             import numpy as np
             from PIL import Image as PILImage
+            cfg = _runtime_detector_config()
 
             # --- Image Preparation ---
             # Convert PIL image to OpenCV format if needed
@@ -54,7 +76,7 @@ class LocalChartDetector:
             height, width = image_cv.shape[:2]
 
             # Always downscale for detection (even if caller forgot)
-            MAX_DETECT_DIM = 900
+            MAX_DETECT_DIM = int(cfg["max_detect_dim"])
             if max(height, width) > MAX_DETECT_DIM:
                 scale = MAX_DETECT_DIM / max(height, width)
                 image_cv = cv2.resize(image_cv, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
@@ -103,7 +125,16 @@ class LocalChartDetector:
                         diag_lines_raw += 1
                         raw_angles.append(angle)
 
-            run_circles = diag_lines_raw >= 1 or line_count >= 6
+            # Fast-path bailout: sparse geometry is highly unlikely to be a real chart.
+            if cfg["fast_mode"] and line_count < 6 and overall_edge_density < 0.02:
+                total_time = time.time() - start_time
+                logger.debug(f"?? OpenCV detection: {total_time*1000:.0f}ms (fast sparse reject)")
+                return _chart_result(False, 0.0, [], "Sparse geometry; likely non-chart", line_count, 0, overall_edge_density)
+
+            run_circles = (
+                diag_lines_raw >= int(cfg["min_diag_lines_for_circles"])
+                or line_count >= int(cfg["min_lines_for_circles"])
+            )
 
             # --- Circle Detection (Optimized) ---
             circle_count = 0

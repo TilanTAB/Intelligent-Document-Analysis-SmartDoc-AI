@@ -4,6 +4,7 @@ import logging
 import json
 import re
 import struct  # For handling struct.error exceptions
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -23,6 +24,67 @@ from core.perf_monitor import latency_monitor
 
 logger = logging.getLogger(__name__)
 
+
+PDF_ANALYSIS_MODES = {"pdf_only", "vision_only", "both"}
+CHART_DETECTION_BACKENDS = {"pdfplumber", "opencv_optimized"}
+
+
+def normalize_pdf_analysis_mode(mode: Optional[str]) -> str:
+    """Normalize analysis mode values and aliases into supported canonical values."""
+    raw_mode = str(mode or "").strip().lower()
+    aliases = {
+        "pdf": "pdf_only",
+        "text": "pdf_only",
+        "vision": "vision_only",
+        "image": "vision_only",
+        "hybrid": "both",
+        "all": "both",
+    }
+    normalized = aliases.get(raw_mode, raw_mode)
+    if normalized not in PDF_ANALYSIS_MODES:
+        return "both"
+    return normalized
+
+
+def normalize_chart_detection_backend(backend: Optional[str]) -> str:
+    """Normalize chart detection backend values and aliases into canonical names."""
+    raw_backend = str(backend or "").strip().lower()
+    aliases = {
+        "pdf": "pdfplumber",
+        "pdf_parser": "pdfplumber",
+        "structural": "pdfplumber",
+        "opencv": "opencv_optimized",
+        "local": "opencv_optimized",
+    }
+    normalized = aliases.get(raw_backend, raw_backend)
+    if normalized not in CHART_DETECTION_BACKENDS:
+        return "pdfplumber"
+    return normalized
+
+
+def _is_full_page_vision_detection(detection_result: Dict[str, Any]) -> bool:
+    """Return True when detection metadata represents forced full-page vision analysis."""
+    result = detection_result or {}
+    features = result.get("features") or {}
+    chart_types = result.get("chart_types") or []
+    return bool(features.get("full_page_vision")) or "full_page_vision" in chart_types
+
+
+def _detection_method_label(detection_result: Dict[str, Any], vision_provider: str, is_batch: bool) -> str:
+    """Human-readable extraction method label for chart/page chunks."""
+    result = detection_result or {}
+    features = result.get("features") or {}
+    chart_types = set(result.get("chart_types") or [])
+    if _is_full_page_vision_detection(detection_result):
+        mode_label = "Batch" if is_batch else "Sequential"
+        return f"Vision-Only ({vision_provider.upper()} {mode_label} page analysis)"
+    if features.get("pdfplumber_candidate") or "pdfplumber_candidate" in chart_types:
+        mode_label = "Batch" if is_batch else "Sequential"
+        return f"PDFPlumber-Triage + {vision_provider.upper()} {mode_label} analysis"
+    if is_batch:
+        return f"Hybrid (Local OpenCV + {vision_provider.upper()} Batch Analysis)"
+    return f"Hybrid (Local OpenCV + {vision_provider.upper()} Sequential)"
+
 def preprocess_image(image, max_dim=1000):
     """Downscale image to max_dim before OpenCV processing."""
     if max(image.size) > max_dim:
@@ -39,7 +101,10 @@ def detect_chart_on_page(args):
     page_num, image = args
     from content_analyzer.visual_detector import LocalChartDetector
     # Downscale image before detection to save memory
-    image = preprocess_image(image, max_dim=1000)
+    image = preprocess_image(
+        image,
+        max_dim=max(256, int(getattr(parameters, "CHART_OPENCV_MAX_DIM", 700) or 700)),
+    )
     detection_result = LocalChartDetector.detect_charts(image)
     return (page_num, image, detection_result)
 
@@ -60,7 +125,10 @@ def detect_chart_on_page_path(args):
 
     try:
         with _Image.open(image_path) as img:
-            prepared = preprocess_image(img.convert("RGB"), max_dim=1000)
+            prepared = preprocess_image(
+                img.convert("RGB"),
+                max_dim=max(256, int(getattr(parameters, "CHART_OPENCV_MAX_DIM", 700) or 700)),
+            )
             detection_result = LocalChartDetector.detect_charts(prepared)
         return (page_num, str(image_path), detection_result)
     except Exception as e:
@@ -372,7 +440,32 @@ def analyze_batch(batch_tuple):
     try:
         import logging
         logger = logging.getLogger(__name__)
-        prompt = f"""
+        full_page_mode = all(_is_full_page_vision_detection(detection_result or {}) for _, _, detection_result in batch)
+        if full_page_mode:
+            prompt = f"""
+Analyze the following {len(batch)} document page image(s) in order.
+
+Return JSON ONLY (no markdown or prose wrapper) using this schema:
+{{
+  "charts": [
+    {{
+      "chart_number": 1,
+      "analysis": "..."
+    }}
+  ]
+}}
+
+For each page analysis include:
+- Page Summary
+- Headings / Sections
+- Key Facts and Figures (with units and dates)
+- Visible Table-like Data (if any)
+- Visible Chart/Graph Insights (if any)
+- Entities (organizations, countries, products, people)
+- Important caveats or ambiguities in extraction
+"""
+        else:
+            prompt = f"""
 Analyze the following {len(batch)} chart(s)/graph(s) in order.
 
 Return JSON ONLY (no markdown or prose wrapper) using this schema:
@@ -419,17 +512,28 @@ For each chart analysis include:
         batch_docs = []
         for idx, (page_num, image_path, detection_result) in enumerate(batch):
             analysis = analyses[idx] if idx < len(analyses) else "Analysis unavailable (parsing error)"
-            chart_types_str = ", ".join(detection_result['chart_types']) or "Unknown"
-            confidence = detection_result['confidence']
+            detection_result = detection_result or {}
+            chart_types_str = ", ".join(detection_result.get("chart_types", [])) or "Unknown"
+            confidence = float(detection_result.get("confidence", 0.0) or 0.0)
+            detection_method = _detection_method_label(
+                detection_result=detection_result,
+                vision_provider=vision_provider,
+                is_batch=True,
+            )
+            is_full_page_mode = _is_full_page_vision_detection(detection_result)
+            heading = "### 📄 Vision Page Analysis" if is_full_page_mode else "### 📊 Chart Analysis"
+            doc_type = "text" if is_full_page_mode else "chart"
+            extraction_method = "vision_only_full_page" if is_full_page_mode else "hybrid_batch"
             chart_doc = Document(
-                page_content=f"""### 📊 Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + {vision_provider.upper()} Batch Analysis)\n**Local Confidence**: {confidence:.0%}\n**Detected Types**: {chart_types_str}\n**Batch Size**: {len(batch)} charts analyzed together\n\n---\n\n{analysis}\n""",
+                page_content=f"""{heading} (Page {page_num})\n\n**Detection Method**: {detection_method}\n**Local Confidence**: {confidence:.0%}\n**Detected Types**: {chart_types_str}\n**Batch Size**: {len(batch)} items analyzed together\n\n---\n\n{analysis}\n""",
                 metadata={
                     "source": file_path,
                     "page": page_num,
-                    "type": "chart",
-                    "extraction_method": "hybrid_batch",
+                    "type": doc_type,
+                    "extraction_method": extraction_method,
                     "detection_confidence": confidence,
-                    "batch_size": len(batch)
+                    "batch_size": len(batch),
+                    "chart_image_path": str(image_path),
                 }
             )
             batch_docs.append(chart_doc)
@@ -448,12 +552,15 @@ class DocumentProcessor:
     OpenCV detection and provider-based vision analysis with parallelization for speed.
     """
     # Cache metadata version - increment when cache format changes
-    CACHE_VERSION = 4  # Incremented for chart extraction support
+    CACHE_VERSION = 6  # Incremented for persisted chart assets robustness + dead temp-path cache invalidation
 
     def __init__(self):
         """Initialize the document processor with cache directory and splitter configuration."""
         self.cache_dir = Path(parameters.CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.chart_assets_dir = self.cache_dir / "chart_assets"
+        self.chart_assets_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_expired_chart_assets()
         # Content-type-aware splitters (adaptive chunking).
         self.splitter_text = RecursiveCharacterTextSplitter(
             chunk_size=max(1, int(parameters.CHUNK_SIZE_TEXT or parameters.CHUNK_SIZE)),
@@ -486,6 +593,12 @@ class DocumentProcessor:
             )
         # Instance-level flag instead of modifying global parameters
         self.chart_extraction_enabled = parameters.ENABLE_CHART_EXTRACTION
+        self.default_pdf_analysis_mode = normalize_pdf_analysis_mode(
+            getattr(parameters, "PDF_ANALYSIS_MODE", "both")
+        )
+        self.default_chart_detection_backend = normalize_chart_detection_backend(
+            getattr(parameters, "CHART_DETECTION_BACKEND", "pdfplumber")
+        )
         if self.chart_extraction_enabled:
             self._init_vision_client()
         logger.debug(f"DocumentProcessor initialized with cache dir: {self.cache_dir}")
@@ -499,6 +612,8 @@ class DocumentProcessor:
             parameters.CHUNK_OVERLAP_CHART,
         )
         logger.debug(f"Chart extraction: {'enabled' if self.chart_extraction_enabled else 'disabled'}")
+        logger.debug("Default PDF analysis mode: %s", self.default_pdf_analysis_mode)
+        logger.debug("Default chart detection backend: %s", self.default_chart_detection_backend)
 
     def _init_vision_client(self):
         """Initialize vision client for chart analysis based on provider."""
@@ -569,6 +684,56 @@ class DocumentProcessor:
     def _generate_hash(self, content: bytes) -> str:
         """Generate SHA-256 hash of file content."""
         return hashlib.sha256(content).hexdigest()
+
+    def _generate_file_hash(self, file_path: str) -> str:
+        """Generate SHA-256 hash of a file without loading it fully into memory."""
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _cleanup_expired_chart_assets(self) -> None:
+        """Delete old persisted chart assets and prune empty directories."""
+        chart_assets_dir = getattr(self, "chart_assets_dir", None)
+        if not chart_assets_dir or not chart_assets_dir.exists():
+            return
+
+        expire_days = max(
+            1,
+            int(getattr(parameters, "CHART_ASSET_EXPIRE_DAYS", parameters.CACHE_EXPIRE_DAYS)),
+        )
+        cutoff_ts = (datetime.now() - timedelta(days=expire_days)).timestamp()
+        removed_files = 0
+
+        try:
+            for asset_file in chart_assets_dir.rglob("*"):
+                if not asset_file.is_file():
+                    continue
+                try:
+                    if asset_file.stat().st_mtime < cutoff_ts:
+                        asset_file.unlink(missing_ok=True)
+                        removed_files += 1
+                except Exception:
+                    continue
+
+            # Clean up now-empty per-document folders.
+            for folder in sorted(chart_assets_dir.rglob("*"), reverse=True):
+                if folder.is_dir():
+                    try:
+                        folder.rmdir()
+                    except OSError:
+                        pass
+        except Exception as e:
+            logger.warning("Chart asset cleanup failed: %s", e)
+            return
+
+        if removed_files:
+            logger.info(
+                "Cleaned up %s expired chart assets (retention_days=%s)",
+                removed_files,
+                expire_days,
+            )
     
     def _is_cache_valid(self, cache_path: Path) -> bool:
         """Check if a cache file exists and is still valid (not expired)."""
@@ -593,6 +758,11 @@ class DocumentProcessor:
             
             if "chunks" not in data or "timestamp" not in data:
                 raise KeyError("Cache file missing 'chunks' or 'timestamp' key.")
+            cache_version = int(data.get("cache_version", 0))
+            if cache_version != int(self.CACHE_VERSION):
+                raise KeyError(
+                    f"Cache version mismatch (found={cache_version}, expected={self.CACHE_VERSION})"
+                )
 
             logger.info(f"Loaded {len(data['chunks'])} chunks from cache: {cache_path.name}")
             return data["chunks"]
@@ -612,6 +782,7 @@ class DocumentProcessor:
             with open(cache_path, "wb") as f:
                 pickle.dump({
                     "timestamp": datetime.now().timestamp(),
+                    "cache_version": int(self.CACHE_VERSION),
                     "chunks": chunks
                 }, f)
             logger.info(f"Successfully cached {len(chunks)} chunks to {cache_path.name}")
@@ -644,23 +815,235 @@ class DocumentProcessor:
             return self.splitter_chart
         if doc_type == "table":
             return self.splitter_table
+        # Heuristic: many PDF pages are emitted as type=text even when dominated by tables.
+        if self._is_table_like_content(doc.page_content):
+            return self.splitter_table
         return self.splitter_text
+
+    @staticmethod
+    def _is_table_like_content(text: str) -> bool:
+        """Heuristic detector for markdown-like / extracted table fragments."""
+        sample = (text or "")[:8000]
+        if not sample:
+            return False
+        lowered = sample.lower()
+        if "### table" in lowered:
+            return True
+        pipe_count = sample.count("|")
+        newline_count = sample.count("\n")
+        if "| ---" in sample and pipe_count >= 8:
+            return True
+        # Weak fallback for borderless extraction that still keeps many delimiters.
+        return pipe_count >= 30 and newline_count >= 4
+
+    def _compress_table_fragment(self, text: str) -> str:
+        """
+        Compact repetitive table artifacts while preserving semantic table content.
+
+        This targets repeated markdown separators/headers introduced by OCR/table extraction.
+        """
+        if not text:
+            return ""
+        lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
+        if not lines:
+            return ""
+
+        compact_lines: List[str] = []
+        prev_line = ""
+        seen_table_header = False
+        seen_separator = False
+        header_pattern = re.compile(r"^###\s*table\s+\d+\s*\(page\s*\d+\)", re.IGNORECASE)
+        separator_pattern = re.compile(r"^\|\s*[-: ]+\|\s*$")
+
+        for line in lines:
+            # Normalize pipe spacing and repeated spaces.
+            normalized_line = re.sub(r"\s*\|\s*", " | ", line)
+            normalized_line = re.sub(r"[ \t]+", " ", normalized_line).strip()
+
+            # Canonicalize table header labels for dedupe stability.
+            if header_pattern.match(normalized_line):
+                normalized_line = "### Table"
+                if seen_table_header:
+                    continue
+                seen_table_header = True
+
+            # Drop duplicated consecutive lines (very common in extracted table chunks).
+            if normalized_line == prev_line:
+                continue
+
+            if separator_pattern.match(normalized_line):
+                if seen_separator:
+                    continue
+                seen_separator = True
+            else:
+                seen_separator = False
+
+            compact_lines.append(normalized_line)
+            prev_line = normalized_line
+
+        return "\n".join(compact_lines).strip()
+
+    def _build_chunk_dedupe_fingerprint(self, normalized_chunk: str, doc_type: str) -> str:
+        """Build dedupe fingerprint with table-aware canonicalization."""
+        if not normalized_chunk:
+            return ""
+        if doc_type == "table" and parameters.PRE_INGEST_TABLE_CANONICAL_DEDUPE:
+            fingerprint = normalized_chunk.lower()
+            # Remove table index/page counters from headings.
+            fingerprint = re.sub(
+                r"###\s*table\s+\d+\s*\(page\s*\d+\)",
+                "### table",
+                fingerprint,
+                flags=re.IGNORECASE,
+            )
+            # Normalize whitespace around separators.
+            fingerprint = re.sub(r"\s*\|\s*", "|", fingerprint)
+            fingerprint = re.sub(r"\s+", " ", fingerprint).strip()
+            return fingerprint
+        return normalized_chunk
 
     def _normalize_chunk_text(self, text: str, doc_type: str) -> str:
         """
         Normalize chunk text for dedupe/storage efficiency.
 
-        - Optional whitespace compression for text/table chunks.
+        - Optional whitespace compression for text chunks.
+        - Optional repetitive-line compression for table chunks.
         - Chart chunks keep line breaks to preserve structure cues.
         """
         normalized = (text or "").strip()
         if not normalized:
             return ""
-        if parameters.PRE_INGEST_COMPRESS_WHITESPACE and doc_type != "chart":
+        if doc_type == "table" and parameters.PRE_INGEST_TABLE_COMPRESS_REPEATS:
+            normalized = self._compress_table_fragment(normalized)
+        if parameters.PRE_INGEST_COMPRESS_WHITESPACE and doc_type == "text":
             normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
+
+    def _resolve_pdf_analysis_mode(self, mode_override: Optional[str] = None) -> str:
+        """Resolve runtime PDF analysis strategy with safe fallback."""
+        if mode_override is not None:
+            raw_mode = str(mode_override).strip().lower()
+            mode = normalize_pdf_analysis_mode(mode_override)
+            known_aliases = {"pdf", "text", "vision", "image", "hybrid", "all"}
+            if raw_mode not in PDF_ANALYSIS_MODES and raw_mode not in known_aliases:
+                logger.warning(
+                    "Unsupported pdf_analysis_mode override='%s'; defaulting to '%s'.",
+                    mode_override,
+                    mode,
+                )
+            return mode
+        return self.default_pdf_analysis_mode
+
+    def _resolve_chart_detection_backend(self, backend_override: Optional[str] = None) -> str:
+        """Resolve chart detection backend with safe fallback."""
+        if backend_override is not None:
+            raw_backend = str(backend_override).strip().lower()
+            backend = normalize_chart_detection_backend(backend_override)
+            known_aliases = {"pdf", "pdf_parser", "structural", "opencv", "local"}
+            if raw_backend not in CHART_DETECTION_BACKENDS and raw_backend not in known_aliases:
+                logger.warning(
+                    "Unsupported chart_detection_backend override='%s'; defaulting to '%s'.",
+                    backend_override,
+                    backend,
+                )
+            return backend
+        return self.default_chart_detection_backend
+
+    @staticmethod
+    def _iter_contiguous_page_ranges(page_numbers: List[int]) -> List[Tuple[int, int]]:
+        """Convert sorted page numbers into contiguous [start, end] ranges."""
+        if not page_numbers:
+            return []
+        ordered = sorted({int(p) for p in page_numbers if int(p) > 0})
+        if not ordered:
+            return []
+        ranges: List[Tuple[int, int]] = []
+        start = prev = ordered[0]
+        for page_num in ordered[1:]:
+            if page_num == prev + 1:
+                prev = page_num
+                continue
+            ranges.append((start, prev))
+            start = prev = page_num
+        ranges.append((start, prev))
+        return ranges
+
+    def _detect_chart_candidates_with_pdfplumber(
+        self, file_path: str, total_pages: int
+    ) -> Tuple[List[int], Dict[int, Dict[str, Any]]]:
+        """
+        Fast structural page triage using pdfplumber primitives.
+
+        Returns:
+            candidate_pages: pages likely containing charts/figures.
+            page_signals: per-page lightweight telemetry for debugging.
+        """
+        import pdfplumber
+
+        t_start = datetime.now().timestamp()
+        candidate_pages: List[int] = []
+        page_signals: Dict[int, Dict[str, Any]] = {}
+
+        with pdfplumber.open(file_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                try:
+                    line_count = len(page.lines)
+                    rect_count = len(page.rects)
+                    curve_count = len(page.curves)
+                    image_count = len(page.images)
+                    char_count = len(page.chars)
+
+                    table_like = (
+                        (line_count >= 180 and rect_count >= 70 and curve_count <= 8)
+                        or (line_count >= 260 and curve_count <= 5)
+                    )
+                    vector_chart_like = (
+                        curve_count >= 25
+                        or (curve_count >= 10 and line_count >= 20)
+                        or ((line_count + curve_count) >= 220 and char_count <= 1400)
+                    )
+                    raster_chart_like = image_count >= 1 and char_count <= 1200
+
+                    is_candidate = (vector_chart_like or raster_chart_like) and not table_like
+                    if is_candidate:
+                        candidate_pages.append(page_num)
+
+                    page_signals[page_num] = {
+                        "lines": line_count,
+                        "rects": rect_count,
+                        "curves": curve_count,
+                        "images": image_count,
+                        "chars": char_count,
+                        "table_like": table_like,
+                        "vector_chart_like": vector_chart_like,
+                        "raster_chart_like": raster_chart_like,
+                        "is_candidate": is_candidate,
+                    }
+                except Exception as page_err:
+                    # Fail-open on object parsing errors so we don't miss potential charts.
+                    candidate_pages.append(page_num)
+                    page_signals[page_num] = {
+                        "is_candidate": True,
+                        "forced_candidate": True,
+                        "reason": "pdfplumber_page_parse_error",
+                        "error_type": type(page_err).__name__,
+                    }
+
+        t_end = datetime.now().timestamp()
+        logger.info(
+            "[PROFILE] stage=chart.phase1.pdfplumber_triage duration_s=%.3f pages=%s candidates=%s",
+            t_end - t_start,
+            total_pages,
+            len(candidate_pages),
+        )
+        return sorted(set(candidate_pages)), page_signals
     
-    def _process_file(self, file) -> List[Document]:
+    def _process_file(
+        self,
+        file,
+        pdf_analysis_mode: Optional[str] = None,
+        chart_detection_backend: Optional[str] = None,
+    ) -> List[Document]:
         file_ext = Path(file.name).suffix.lower()
         if file_ext not in ALLOWED_TYPES:
             logger.warning(f"Skipping unsupported file type: {file.name}")
@@ -668,6 +1051,18 @@ class DocumentProcessor:
         try:
             documents = []
             if file_ext == '.pdf':
+                analysis_mode = self._resolve_pdf_analysis_mode(pdf_analysis_mode)
+                resolved_chart_backend = self._resolve_chart_detection_backend(chart_detection_backend)
+                logger.info(
+                    "[PROFILE] stage=parse.strategy mode=%s file=%s",
+                    analysis_mode,
+                    Path(file.name).name,
+                )
+                logger.info(
+                    "[PROFILE] stage=chart.detect.strategy backend=%s file=%s",
+                    resolved_chart_backend,
+                    Path(file.name).name,
+                )
                 import concurrent.futures
                 def run_text_parse():
                     t_parse_start = datetime.now().timestamp()
@@ -687,34 +1082,60 @@ class DocumentProcessor:
                         f"vision_client={self.vision_client is not None}, provider={self.vision_provider}"
                     )
                     if self.chart_extraction_enabled and self.vision_client:
-                        return self._extract_charts_from_pdf(file.name)
+                        return self._extract_charts_from_pdf(
+                            file.name,
+                            analyze_all_pages=(analysis_mode == "vision_only"),
+                            detection_backend=resolved_chart_backend,
+                        )
+                    if analysis_mode == "vision_only":
+                        provider_name = str(self.vision_provider or "none").lower()
+                        if provider_name == "none":
+                            raise RuntimeError(
+                                "VISION_ONLY mode requires a vision provider. "
+                                "Set VISION_PROVIDER to 'azure' or 'google'."
+                            )
+                        raise RuntimeError(
+                            "VISION_ONLY mode requires chart/page vision extraction, "
+                            "but vision client is unavailable."
+                        )
                     return []
-                try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                        future_pdf = executor.submit(run_text_parse)
-                        future_charts = executor.submit(run_charts)
-                        try:
-                            docs = future_pdf.result()
-                        except MemoryError as e:
-                            logger.error(f"Out of memory in text parsing thread: {e}. Falling back to fidelity parser.")
-                            docs = self._load_pdf_with_pdfplumber(file.name)
-                        try:
-                            chart_docs = future_charts.result()
-                        except MemoryError as e:
-                            logger.error(f"Out of memory in chart extraction thread: {e}. Falling back to sequential.")
-                            chart_docs = self._extract_charts_from_pdf(file.name)
-                        documents = docs or []
-                        if chart_docs:
-                            documents.extend(chart_docs)
-                            logger.info(f"📊 Added {len(chart_docs)} chart descriptions to {file.name}")
-                except MemoryError as e:
-                    logger.error(f"Out of memory in parallel PDF processing: {e}. Falling back to sequential.")
-                    documents = self._load_pdf_by_mode(file.name)
-                    if self.chart_extraction_enabled and self.vision_client:
-                        chart_docs = self._extract_charts_from_pdf(file.name)
-                        if chart_docs:
-                            documents.extend(chart_docs)
-                            logger.info(f"📊 Added {len(chart_docs)} chart descriptions to {file.name}")
+                if analysis_mode == "pdf_only":
+                    documents = run_text_parse() or []
+                elif analysis_mode == "vision_only":
+                    documents = run_charts() or []
+                else:
+                    try:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                            future_pdf = executor.submit(run_text_parse)
+                            future_charts = executor.submit(run_charts)
+                            try:
+                                docs = future_pdf.result()
+                            except MemoryError as e:
+                                logger.error(f"Out of memory in text parsing thread: {e}. Falling back to fidelity parser.")
+                                docs = self._load_pdf_with_pdfplumber(file.name)
+                            try:
+                                chart_docs = future_charts.result()
+                            except MemoryError as e:
+                                logger.error(f"Out of memory in chart extraction thread: {e}. Falling back to sequential.")
+                                chart_docs = self._extract_charts_from_pdf(
+                                    file.name,
+                                    detection_backend=resolved_chart_backend,
+                                )
+                            documents = docs or []
+                            if chart_docs:
+                                documents.extend(chart_docs)
+                                logger.info(f"📊 Added {len(chart_docs)} chart descriptions to {file.name}")
+                    except MemoryError as e:
+                        logger.error(f"Out of memory in parallel PDF processing: {e}. Falling back to sequential.")
+                        documents = self._load_pdf_by_mode(file.name)
+                        if self.chart_extraction_enabled and self.vision_client:
+                            chart_docs = self._extract_charts_from_pdf(
+                                file.name,
+                                detection_backend=resolved_chart_backend,
+                            )
+                            if chart_docs:
+                                documents.extend(chart_docs)
+                                logger.info(f"📊 Added {len(chart_docs)} chart descriptions to {file.name}")
             else:
                 from langchain_community.document_loaders import (
                     Docx2txtLoader,
@@ -737,9 +1158,7 @@ class DocumentProcessor:
                 return []
             all_chunks = []
             # --- STABLE FILE HASHING ---
-            with open(file.name, 'rb') as f:
-                file_bytes = f.read()
-            file_hash = self._generate_hash(file_bytes)  # Stable hash by file content
+            file_hash = self._generate_file_hash(file.name)  # Stable hash by file content
             stable_source = f"{Path(file.name).name}::{file_hash}"
             t_chunk_start = datetime.now().timestamp()
             seen_chunk_hashes = set()
@@ -750,27 +1169,54 @@ class DocumentProcessor:
                 splitter = self._select_splitter_for_doc(doc)
                 page_chunks = splitter.split_text(doc.page_content)
                 for j, chunk in enumerate(page_chunks):
-                    normalized_chunk = self._normalize_chunk_text(chunk, doc_type=doc_type)
-                    if len(normalized_chunk) < max(0, int(parameters.PRE_INGEST_MIN_CHUNK_CHARS)):
+                    chunk_doc_type = doc_type
+                    if chunk_doc_type == "text" and self._is_table_like_content(chunk):
+                        chunk_doc_type = "table"
+
+                    normalized_chunk = self._normalize_chunk_text(chunk, doc_type=chunk_doc_type)
+                    min_chars = (
+                        int(parameters.PRE_INGEST_MIN_TABLE_CHUNK_CHARS)
+                        if chunk_doc_type == "table"
+                        else int(parameters.PRE_INGEST_MIN_CHUNK_CHARS)
+                    )
+                    if len(normalized_chunk) < max(0, min_chars):
                         dropped_tiny += 1
                         continue
 
                     if parameters.PRE_INGEST_DEDUPE_ENABLED:
-                        chunk_hash = hashlib.sha256(normalized_chunk.encode("utf-8")).hexdigest()
+                        dedupe_fingerprint = self._build_chunk_dedupe_fingerprint(
+                            normalized_chunk,
+                            doc_type=chunk_doc_type,
+                        )
+                        chunk_hash = hashlib.sha256(dedupe_fingerprint.encode("utf-8")).hexdigest()
                         if chunk_hash in seen_chunk_hashes:
                             dropped_dupes += 1
                             continue
                         seen_chunk_hashes.add(chunk_hash)
 
                     chunk_id = f"txt_{file_hash}_{doc.metadata.get('page', i + 1)}_{j}"
+                    chunk_metadata = {
+                        "source": stable_source,
+                        "page": doc.metadata.get("page", i + 1),
+                        "type": chunk_doc_type,
+                        "chunk_id": chunk_id,
+                    }
+                    if doc.metadata.get("chunk_id"):
+                        chunk_metadata["origin_chunk_id"] = doc.metadata.get("chunk_id")
+                    # Preserve high-value extraction metadata for downstream analytics/benchmarking.
+                    for key in (
+                        "extraction_method",
+                        "detection_confidence",
+                        "batch_size",
+                        "loader",
+                        "tables_count",
+                        "chart_image_path",
+                    ):
+                        if key in doc.metadata:
+                            chunk_metadata[key] = doc.metadata.get(key)
                     chunk_doc = Document(
                         page_content=normalized_chunk,
-                        metadata={
-                            "source": stable_source,                            
-                            "page": doc.metadata.get("page", i + 1),
-                            "type": doc.metadata.get("type", "text"),
-                            "chunk_id": chunk_id
-                        }
+                        metadata=chunk_metadata
                     )
                     all_chunks.append(chunk_doc)
             t_chunk_end = datetime.now().timestamp()
@@ -792,11 +1238,23 @@ class DocumentProcessor:
             logger.error(f"Failed to process {file.name}: {e}", exc_info=True)
             raise
 
-    def _extract_charts_from_pdf(self, file_path: str) -> List[Document]:
+    def _extract_charts_from_pdf(
+        self,
+        file_path: str,
+        analyze_all_pages: bool = False,
+        detection_backend: Optional[str] = None,
+    ) -> List[Document]:
         """
         Extract and analyze charts/graphs from PDF with true batch processing and parallelism.
-        PHASE 1: Parallel local chart detection (CPU-bound, uses ProcessPoolExecutor)
+        PHASE 1: Candidate-page detection (pdfplumber triage OR optimized OpenCV)
         PHASE 2: Parallel vision batch analysis (I/O-bound, uses ThreadPoolExecutor)
+
+        Args:
+            file_path: Path to PDF file.
+            analyze_all_pages: When True, bypass local chart detection and send every
+                page image to vision analysis. Used by vision-only parsing mode.
+            detection_backend: Phase-1 chart candidate backend
+                (pdfplumber | opencv_optimized).
         """
         file_bytes = Path(file_path).read_bytes()
         file_hash = self._generate_hash(file_bytes)
@@ -821,14 +1279,28 @@ class DocumentProcessor:
             import tempfile
             import os
             
-            # Import local detector if enabled
-            use_local = parameters.CHART_USE_LOCAL_DETECTION
+            resolved_backend = self._resolve_chart_detection_backend(detection_backend)
+            if resolved_backend == "opencv_optimized" and not parameters.CHART_USE_LOCAL_DETECTION:
+                logger.warning(
+                    "CHART_USE_LOCAL_DETECTION=false with backend=opencv_optimized; "
+                    "falling back to pdfplumber backend."
+                )
+                resolved_backend = "pdfplumber"
+            use_local = parameters.CHART_USE_LOCAL_DETECTION and resolved_backend == "opencv_optimized"
             if use_local:
                 try:
-                    from content_analyzer.visual_detector import LocalChartDetector
-                    logger.info(f"📊 [BATCH MODE] Local detection → Temp cache → Batch analysis")
+                    from content_analyzer.visual_detector import LocalChartDetector  # noqa: F401
+                    logger.info(
+                        "📊 [BATCH MODE] OpenCV optimized detection enabled "
+                        "(backend=%s, max_dim=%s, workers=%s, process_pool=%s)",
+                        resolved_backend,
+                        getattr(parameters, "CHART_OPENCV_MAX_DIM", 700),
+                        getattr(parameters, "CHART_OPENCV_WORKERS", 4),
+                        getattr(parameters, "CHART_OPENCV_USE_PROCESS_POOL", False),
+                    )
                 except ImportError:
-                    logger.warning("Local chart detector not available, falling back to vision model")
+                    logger.warning("OpenCV chart detector unavailable; switching detection backend to pdfplumber")
+                    resolved_backend = "pdfplumber"
                     use_local = False
             
             # Track statistics
@@ -837,7 +1309,10 @@ class DocumentProcessor:
                 'charts_detected_local': 0,
                 'charts_analyzed_vision': 0,
                 'api_calls_saved': 0,
-                'batch_api_calls': 0
+                'batch_api_calls': 0,
+                'persisted_assets_count': 0,
+                'persist_fallback_copy_count': 0,
+                'persist_failed_temp_fallback_count': 0,
             }
             
             # Get PDF page count
@@ -848,6 +1323,8 @@ class DocumentProcessor:
             
             # Create temp directory for chart images
             temp_dir = tempfile.mkdtemp(prefix='charts_')
+            chart_assets_dir = self.chart_assets_dir / file_hash
+            chart_assets_dir.mkdir(parents=True, exist_ok=True)
             detected_charts = []  # [(page_num, image_path, detection_result), ...]
             
             try:
@@ -927,28 +1404,148 @@ class DocumentProcessor:
                         _safe_delete(page_image_path)
                         return
 
-                    logger.info(f"📈 Chart detected on page {page_num} (confidence: {confidence:.0%})")
-                    stats['charts_detected_local'] += 1
+                    if _is_full_page_vision_detection(detection_result):
+                        logger.debug(f"📄 Vision-only page queued for analysis: page {page_num}")
+                    else:
+                        logger.info(f"📈 Chart detected on page {page_num} (confidence: {confidence:.0%})")
+                        stats['charts_detected_local'] += 1
 
-                    chart_path = os.path.join(temp_dir, f'chart_page_{page_num}.jpg')
                     source_path = str(page_image_path)
-                    if os.path.abspath(source_path) != os.path.abspath(chart_path):
+                    page_mode = "vision_page" if _is_full_page_vision_detection(detection_result) else "chart"
+                    asset_path = (chart_assets_dir / f"{page_mode}_page_{int(page_num):04d}.jpg").resolve()
+                    persisted_path = str(asset_path)
+                    persist_failed = False
+
+                    try:
+                        if os.path.abspath(source_path) != os.path.abspath(persisted_path):
+                            os.replace(source_path, persisted_path)
+                        else:
+                            persisted_path = source_path
+                    except Exception:
                         try:
-                            os.replace(source_path, chart_path)
+                            shutil.copy2(source_path, persisted_path)
+                            _safe_delete(source_path)
+                            stats['persist_fallback_copy_count'] += 1
+                        except Exception as copy_err:
+                            logger.warning(
+                                "Failed to persist chart asset for page %s (%s). Using temp path.",
+                                page_num,
+                                copy_err,
+                            )
+                            persisted_path = source_path
+                            persist_failed = True
+
+                    if not persist_failed:
+                        persisted_exists = False
+                        try:
+                            persisted_exists = Path(persisted_path).exists()
                         except Exception:
-                            # Best-effort fallback: keep original path if rename fails.
-                            chart_path = source_path
-                    detected_charts.append((page_num, chart_path, detection_result))
+                            persisted_exists = False
+                        if persisted_exists:
+                            persisted_path = str(Path(persisted_path).resolve())
+                            stats['persisted_assets_count'] += 1
+                        else:
+                            logger.warning(
+                                "Persist target missing after write for page %s (%s). Falling back to source path.",
+                                page_num,
+                                persisted_path,
+                            )
+                            persisted_path = source_path
+                            stats['persist_failed_temp_fallback_count'] += 1
+                    else:
+                        stats['persist_failed_temp_fallback_count'] += 1
+
+                    detected_charts.append((page_num, persisted_path, detection_result))
 
                 detected_charts = []
-                if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
-                    max_workers = min(os.cpu_count() or 2, 4)
+                if analyze_all_pages:
                     logger.info(
-                        "Parallel local chart detection using ProcessPoolExecutor "
-                        f"(workers={max_workers}) with automatic fallback to threads"
+                        "Phase 1 (vision-only): bypassing local chart detection and queuing all %s pages for vision analysis.",
+                        total_pages,
                     )
-                    process_pool_available = True
+                    for batch_start in range(1, total_pages + 1, detection_batch_size):
+                        batch_end = min(batch_start + detection_batch_size - 1, total_pages)
+                        logger.debug(f"Vision-only batch enqueue: pages {batch_start}-{batch_end}")
+                        try:
+                            page_image_tuples = _load_page_images_as_paths(batch_start, batch_end)
+                        except Exception as e:
+                            logger.warning(f"Failed to render pages {batch_start}-{batch_end}: {e}")
+                            continue
+                        for page_num, page_image_path in page_image_tuples:
+                            _store_detected_chart(
+                                page_num=page_num,
+                                page_image_path=page_image_path,
+                                detection_result={
+                                    "has_chart": True,
+                                    "confidence": 1.0,
+                                    "chart_types": ["full_page_vision"],
+                                    "description": "Vision-only page analysis",
+                                    "features": {"full_page_vision": True},
+                                },
+                            )
+                        del page_image_tuples
+                        gc.collect()
+                elif resolved_backend == "pdfplumber":
+                    logger.info(
+                        "Phase 1 (pdfplumber): structural candidate triage enabled "
+                        "(backend=%s, pages=%s)",
+                        resolved_backend,
+                        total_pages,
+                    )
+                    candidate_pages, page_signals = self._detect_chart_candidates_with_pdfplumber(
+                        file_path=file_path,
+                        total_pages=total_pages,
+                    )
+                    stats["api_calls_saved"] += max(0, total_pages - len(candidate_pages))
+                    if not candidate_pages:
+                        logger.info("No chart candidates selected by pdfplumber triage.")
+                    else:
+                        logger.info(
+                            "pdfplumber triage selected %s/%s pages for vision analysis.",
+                            len(candidate_pages),
+                            total_pages,
+                        )
+                        for batch_start, batch_end in self._iter_contiguous_page_ranges(candidate_pages):
+                            try:
+                                page_image_tuples = _load_page_images_as_paths(batch_start, batch_end)
+                            except Exception as e:
+                                logger.warning(f"Failed to render candidate pages {batch_start}-{batch_end}: {e}")
+                                continue
 
+                            for page_num, page_image_path in page_image_tuples:
+                                signal = page_signals.get(page_num, {})
+                                chart_types = ["pdfplumber_candidate"]
+                                if signal.get("forced_candidate"):
+                                    chart_types.append("pdfplumber_parse_error")
+                                _store_detected_chart(
+                                    page_num=page_num,
+                                    page_image_path=page_image_path,
+                                    detection_result={
+                                        "has_chart": True,
+                                        "confidence": float(signal.get("confidence", 0.75)),
+                                        "chart_types": chart_types,
+                                        "description": str(
+                                            signal.get("reason", "pdfplumber structural chart candidate")
+                                        ),
+                                        "features": {"pdfplumber_candidate": True, **signal},
+                                    },
+                                )
+                            del page_image_tuples
+                            gc.collect()
+                    # pages_scanned is incremented while rendering candidate pages;
+                    # expose full-triage coverage in logs/metrics for observability.
+                    stats["pages_scanned"] = total_pages
+                elif use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
+                    max_workers = max(1, int(getattr(parameters, "CHART_OPENCV_WORKERS", 4) or 4))
+                    use_process_pool = bool(getattr(parameters, "CHART_OPENCV_USE_PROCESS_POOL", False))
+                    logger.info(
+                        "Phase 1 (opencv_optimized): local detection workers=%s process_pool=%s max_dim=%s",
+                        max_workers,
+                        use_process_pool,
+                        getattr(parameters, "CHART_OPENCV_MAX_DIM", 700),
+                    )
+
+                    process_pool_available = use_process_pool
                     for batch_start in range(1, total_pages + 1, detection_batch_size):
                         batch_end = min(batch_start + detection_batch_size - 1, total_pages)
                         logger.debug(f"Processing detection batch: pages {batch_start}-{batch_end}")
@@ -992,35 +1589,21 @@ class DocumentProcessor:
                         del results
                         gc.collect()
                         logger.debug(f"Batch {batch_start}-{batch_end} complete, memory released")
-                elif use_local:
-                    logger.info("Using sequential local chart detection fallback...")
-                    for batch_start in range(1, total_pages + 1, detection_batch_size):
-                        batch_end = min(batch_start + detection_batch_size - 1, total_pages)
-                        logger.debug(f"Sequential detection batch: pages {batch_start}-{batch_end}")
-
-                        try:
-                            page_image_tuples = _load_page_images_as_paths(batch_start, batch_end)
-                        except Exception as e:
-                            logger.warning(f"Failed to render pages {batch_start}-{batch_end}: {e}")
-                            continue
-
-                        for args in page_image_tuples:
-                            page_num, page_image_path, detection_result = detect_chart_on_page_path(args)
-                            _store_detected_chart(
-                                page_num=page_num,
-                                page_image_path=page_image_path,
-                                detection_result=detection_result or {},
-                            )
-
-                        del page_image_tuples
-                        gc.collect()
                 else:
                     logger.info(
-                        "Local chart detection disabled (CHART_USE_LOCAL_DETECTION=false); "
-                        "skipping Phase 1 detections."
+                        "No valid chart detection backend available "
+                        "(backend=%s, CHART_USE_LOCAL_DETECTION=%s); skipping Phase 1 detections.",
+                        resolved_backend,
+                        parameters.CHART_USE_LOCAL_DETECTION,
                     )
 
                 logger.info(f"Phase 1 complete: {len(detected_charts)} charts detected and cached")
+                logger.info(
+                    "[PROFILE] stage=chart.assets.persist persisted=%s fallback_copy=%s failed_temp_fallback=%s",
+                    stats['persisted_assets_count'],
+                    stats['persist_fallback_copy_count'],
+                    stats['persist_failed_temp_fallback_count'],
+                )
                 phase1_duration = datetime.now().timestamp() - phase1_start
                 latency_monitor.record(
                     stage="chart.phase1",
@@ -1050,7 +1633,7 @@ class DocumentProcessor:
                             self.vision_client,
                             self.vision_provider,
                             self.chart_vision_model,
-                            file_path,
+                            stable_source,
                             parameters,
                             stats,
                         )
@@ -1078,16 +1661,27 @@ class DocumentProcessor:
                     # Sequential processing (batch disabled or single chart)
                     for chart_index, (page_num, image_path, detection_result) in enumerate(detected_charts):
                         try:
-                            extraction_prompt = """Analyze this chart/graph in comprehensive detail:
-                            **Chart Type**: [type]
-                            **Title**: [title]
-                            **Axes**: [X and Y labels/units]
-                            **Data Points**: [extract all visible data]
-                            **Legend**: [series/categories]
-                            **Trends**: [key patterns and insights]
-                            **Key Values**: [max, min, significant]
-                            **Context**: [annotations or notes]
-                            """
+                            is_full_page_mode = _is_full_page_vision_detection(detection_result or {})
+                            if is_full_page_mode:
+                                extraction_prompt = """Analyze this document page in comprehensive detail:
+                                **Page Summary**: [what this page is about]
+                                **Sections/Headings**: [visible structure]
+                                **Key Facts**: [numbers, dates, entities, claims]
+                                **Table-like Data**: [rows/columns and values if visible]
+                                **Chart/Graphic Insights**: [if any visuals exist]
+                                **Important Notes**: [ambiguities / low-confidence reads]
+                                """
+                            else:
+                                extraction_prompt = """Analyze this chart/graph in comprehensive detail:
+                                **Chart Type**: [type]
+                                **Title**: [title]
+                                **Axes**: [X and Y labels/units]
+                                **Data Points**: [extract all visible data]
+                                **Legend**: [series/categories]
+                                **Trends**: [key patterns and insights]
+                                **Key Values**: [max, min, significant]
+                                **Context**: [annotations or notes]
+                                """
                             analysis_text = analyze_chart_images(
                                 client=self.vision_client,
                                 image_paths=[image_path],
@@ -1096,14 +1690,24 @@ class DocumentProcessor:
                                 max_output_tokens=parameters.CHART_MAX_TOKENS,
                                 provider=self.vision_provider,
                             )
-                            chart_types_str = ", ".join(detection_result['chart_types']) or "Unknown"
+                            chart_types_str = ", ".join((detection_result or {}).get('chart_types', [])) or "Unknown"
+                            detection_confidence = float((detection_result or {}).get('confidence', 0.0) or 0.0)
+                            detection_method = _detection_method_label(
+                                detection_result=detection_result or {},
+                                vision_provider=self.vision_provider,
+                                is_batch=False,
+                            )
+                            heading = "### 📄 Vision Page Analysis" if is_full_page_mode else "### 📊 Chart Analysis"
+                            doc_type = "text" if is_full_page_mode else "chart"
+                            extraction_method = "vision_only_full_page" if is_full_page_mode else "hybrid_sequential"
                             chart_doc = Document(
-                                page_content=f"""### \U0001F4CA Chart Analysis (Page {page_num})\n\n**Detection Method**: Hybrid (Local OpenCV + {self.vision_provider.upper()} Sequential)\n**Local Confidence**: {detection_result['confidence']:.0%}\n**Detected Types**: {chart_types_str}\n\n---\n\n{analysis_text}\n""",
+                                page_content=f"""{heading} (Page {page_num})\n\n**Detection Method**: {detection_method}\n**Local Confidence**: {detection_confidence:.0%}\n**Detected Types**: {chart_types_str}\n\n---\n\n{analysis_text}\n""",
                                 metadata={
-                                    "source": file_path,
+                                    "source": stable_source,
                                     "page": page_num,
-                                    "type": "chart",
-                                    "extraction_method": "hybrid_sequential",
+                                    "type": doc_type,
+                                    "extraction_method": extraction_method,
+                                    "chart_image_path": str(image_path),
                                     "chunk_id": f"{file_hash}_{page_num}_{chart_index}"
                                 }
                             )
@@ -1114,7 +1718,7 @@ class DocumentProcessor:
                             logger.error(f"Failed to analyze page {page_num}: {e}")
                 
                 # Log statistics
-                if use_local and parameters.CHART_SKIP_GEMINI_DETECTION:
+                if (resolved_backend in {"pdfplumber", "opencv_optimized"} or analyze_all_pages) and parameters.CHART_SKIP_GEMINI_DETECTION:
                     cost_saved = stats['api_calls_saved'] * 0.0125
                     actual_cost = stats['batch_api_calls'] * 0.0125 if stats['batch_api_calls'] > 0 else stats['charts_analyzed_vision'] * 0.0125
                     
@@ -1124,7 +1728,8 @@ class DocumentProcessor:
                         efficiency = 1.0
                     
                     logger.info(f"""
-📊 Chart Extraction Complete (HYBRID + BATCH MODE):
+📊 Chart Extraction Complete (BATCH MODE):
+   Detection backend: {resolved_backend}
    Pages scanned: {stats['pages_scanned']}
    Charts detected (local): {stats['charts_detected_local']}
    Charts analyzed (Vision): {stats['charts_analyzed_vision']}
@@ -1150,7 +1755,6 @@ class DocumentProcessor:
             finally:
                 # Only clean up after all analysis is done
                 try:
-                    import shutil
                     shutil.rmtree(temp_dir)
                     logger.debug(f"Cleaned up temp directory: {temp_dir}")
                 except Exception as e:
@@ -1175,8 +1779,7 @@ class DocumentProcessor:
         
         t_start = datetime.now().timestamp()
         logger.info(f"[PDFPLUMBER] Processing: {file_path}")
-        file_bytes = Path(file_path).read_bytes()
-        file_hash = self._generate_hash(file_bytes)
+        file_hash = self._generate_file_hash(file_path)
         stable_source = f"{Path(file_path).name}::{file_hash}"
         
         # Strategy 1: Line-based (default) - for tables with visible borders
@@ -1498,11 +2101,16 @@ def run_pdfplumber(file_name):
     processor = DocumentProcessor()
     return processor._load_pdf_with_pdfplumber(file_name)
 
-def run_charts(file_name, enable_chart_extraction, vision_client):
+def run_charts(
+    file_name,
+    enable_chart_extraction,
+    vision_client,
+    detection_backend: Optional[str] = None,
+):
     from content_analyzer.document_parser import DocumentProcessor
     processor = DocumentProcessor()
     processor.vision_client = vision_client
     if enable_chart_extraction and vision_client:
-        return processor._extract_charts_from_pdf(file_name)
+        return processor._extract_charts_from_pdf(file_name, detection_backend=detection_backend)
     return []
 

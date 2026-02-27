@@ -104,8 +104,16 @@ class Settings(BaseSettings):
     PRE_INGEST_DEDUPE_ENABLED: bool = True
     PRE_INGEST_COMPRESS_WHITESPACE: bool = True
     PRE_INGEST_MIN_CHUNK_CHARS: int = 40
+    PRE_INGEST_MIN_TABLE_CHUNK_CHARS: int = 80
+    PRE_INGEST_TABLE_CANONICAL_DEDUPE: bool = True
+    PRE_INGEST_TABLE_COMPRESS_REPEATS: bool = True
     # NOTE: fast/auto parser paths were removed; value is kept for backward compatibility.
     PDF_PARSE_MODE: str = "fidelity"  # accepted: auto | fast | fidelity (all treated as fidelity)
+    # PDF ingestion strategy:
+    # - both: text/tables via pdfplumber + vision chart/page analysis (default)
+    # - pdf_only: text/tables only, no vision-based extraction
+    # - vision_only: vision-based page analysis only (no pdf text parsing)
+    PDF_ANALYSIS_MODE: str = "both"  # pdf_only | vision_only | both
     # Optional page-range parallelism for single large PDFs (disabled by default).
     PDF_PARSE_PAGE_RANGE_WORKERS: int = 1
     PDF_PARSE_PAGE_RANGE_SIZE: int = 24
@@ -140,6 +148,9 @@ class Settings(BaseSettings):
 
     # Logging parameters
     LOG_LEVEL: str = "INFO"
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_WINDOW_S: int = 3600
+    RATE_LIMIT_MAX_CALLS: int = 5
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "smartdoc-ai"
     OTEL_SERVICE_NAMESPACE: str = "smartrag"
@@ -200,6 +211,7 @@ class Settings(BaseSettings):
 
     # Chart extraction parameters
     ENABLE_CHART_EXTRACTION: bool = True
+    CHART_ASSET_EXPIRE_DAYS: int = 7
     CHART_VISION_MODEL: str = "gemini-2.5-flash-lite"  # Use gpt-5-nano for Azure vision
     CHART_MAX_TOKENS: int = 1500
     CHART_DPI: int = Field(default_factory=lambda: 110 if _is_hf() else 110)  # Lower DPI saves memory
@@ -211,6 +223,16 @@ class Settings(BaseSettings):
     CHART_MIN_CONFIDENCE: float = 0.4  # Only analyze charts with confidence > 40%
     CHART_SKIP_GEMINI_DETECTION: bool = True  # Skip Gemini for detection, only use for analysis
     CHART_GEMINI_FALLBACK_ENABLED: bool = False  # Optional: Use Gemini if local fails
+    # Detection backend options:
+    # - pdfplumber: Use PDF structural signals (lines/curves/images/chars) for fast candidate-page triage.
+    # - opencv_optimized: Use local OpenCV detection with conservative performance knobs.
+    CHART_DETECTION_BACKEND: str = "pdfplumber"  # pdfplumber | opencv_optimized
+    CHART_OPENCV_MAX_DIM: int = 700
+    CHART_OPENCV_WORKERS: int = Field(default_factory=lambda: min(max(1, os.cpu_count() or 1), 4))
+    CHART_OPENCV_USE_PROCESS_POOL: bool = False
+    CHART_OPENCV_FAST_MODE: bool = True
+    CHART_OPENCV_MIN_LINES_FOR_CIRCLES: int = 20
+    CHART_OPENCV_MIN_DIAG_LINES_FOR_CIRCLES: int = 2
 
     # Gemini batch processing parameters (speed optimization - 2-3× faster)
     CHART_GEMINI_BATCH_SIZE: int = 1  # Analyze 1 chart per API call (reduced from 2 for reliability)
@@ -252,9 +274,53 @@ class Settings(BaseSettings):
             raise ValueError(f"PDF_PARSE_MODE must be one of {supported}")
         return v_lower
 
+    @field_validator("PDF_ANALYSIS_MODE")
+    @classmethod
+    def validate_pdf_analysis_mode(cls, v: str) -> str:
+        supported = {"pdf_only", "vision_only", "both"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"PDF_ANALYSIS_MODE must be one of {supported}")
+        return v_lower
+
+    @field_validator("CHART_DETECTION_BACKEND")
+    @classmethod
+    def validate_chart_detection_backend(cls, v: str) -> str:
+        supported = {"pdfplumber", "opencv_optimized"}
+        v_lower = v.lower()
+        if v_lower not in supported:
+            raise ValueError(f"CHART_DETECTION_BACKEND must be one of {supported}")
+        return v_lower
+
     @field_validator("PDF_PARSE_PAGE_RANGE_WORKERS", "PDF_PARSE_PAGE_RANGE_SIZE")
     @classmethod
     def validate_positive_pdf_parse_parallel_settings(cls, v: int, info) -> int:
+        if int(v) < 1:
+            raise ValueError(f"{info.field_name} must be >= 1")
+        return int(v)
+
+    @field_validator("PRE_INGEST_MIN_CHUNK_CHARS", "PRE_INGEST_MIN_TABLE_CHUNK_CHARS")
+    @classmethod
+    def validate_non_negative_pre_ingest_thresholds(cls, v: int, info) -> int:
+        if int(v) < 0:
+            raise ValueError(f"{info.field_name} must be >= 0")
+        return int(v)
+
+    @field_validator("RATE_LIMIT_WINDOW_S", "RATE_LIMIT_MAX_CALLS")
+    @classmethod
+    def validate_positive_rate_limit_settings(cls, v: int, info) -> int:
+        if int(v) < 1:
+            raise ValueError(f"{info.field_name} must be >= 1")
+        return int(v)
+
+    @field_validator(
+        "CHART_OPENCV_MAX_DIM",
+        "CHART_OPENCV_WORKERS",
+        "CHART_OPENCV_MIN_LINES_FOR_CIRCLES",
+        "CHART_OPENCV_MIN_DIAG_LINES_FOR_CIRCLES",
+    )
+    @classmethod
+    def validate_positive_chart_opencv_settings(cls, v: int, info) -> int:
         if int(v) < 1:
             raise ValueError(f"{info.field_name} must be >= 1")
         return int(v)
