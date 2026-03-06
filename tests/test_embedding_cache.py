@@ -99,15 +99,15 @@ def test_azure_embeddings_use_dedicated_endpoint(monkeypatch):
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_API_KEY", "chat-key", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_API_KEY", "embedding-key", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_API_VERSION", "2024-08-01-preview", raising=False)
-    monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://chat-resource.openai.azure.com/", raising=False)
-    monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_ENDPOINT", "https://embedding-resource.openai.azure.com/", raising=False)
+    monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://your-chat-resource.openai.azure.com/", raising=False)
+    monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_ENDPOINT", "https://your-embedding-resource.openai.azure.com/", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_DEPLOYMENT", "embed-deployment", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "EMBEDDING_CACHE_ENABLED", False, raising=False)
 
     embeddings = embedding_factory.get_embeddings()
     assert isinstance(embeddings, FakeAzureOpenAIEmbeddings)
     assert embeddings.kwargs["api_key"] == "embedding-key"
-    assert embeddings.kwargs["azure_endpoint"] == "https://embedding-resource.openai.azure.com/"
+    assert embeddings.kwargs["azure_endpoint"] == "https://your-embedding-resource.openai.azure.com/"
     assert embeddings.kwargs["deployment"] == "embed-deployment"
 
 
@@ -127,7 +127,7 @@ def test_azure_embeddings_fallback_to_chat_key(monkeypatch):
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_API_KEY", "chat-key", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_API_KEY", None, raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_API_VERSION", "2024-08-01-preview", raising=False)
-    monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://chat-resource.openai.azure.com/", raising=False)
+    monkeypatch.setattr(embedding_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://your-chat-resource.openai.azure.com/", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_ENDPOINT", None, raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "AZURE_EMBEDDING_DEPLOYMENT", "embed-deployment", raising=False)
     monkeypatch.setattr(embedding_factory.parameters, "EMBEDDING_CACHE_ENABLED", False, raising=False)
@@ -135,4 +135,4 @@ def test_azure_embeddings_fallback_to_chat_key(monkeypatch):
     embeddings = embedding_factory.get_embeddings()
     assert isinstance(embeddings, FakeAzureOpenAIEmbeddings)
     assert embeddings.kwargs["api_key"] == "chat-key"
-    assert embeddings.kwargs["azure_endpoint"] == "https://chat-resource.openai.azure.com/"
+    assert embeddings.kwargs["azure_endpoint"] == "https://your-chat-resource.openai.azure.com/"

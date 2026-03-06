@@ -53,7 +53,7 @@ def test_azure_gpt5_uses_max_completion_tokens(monkeypatch):
     monkeypatch.setattr(llm_factory, "AzureChatOpenAI", _CaptureAzure)
     monkeypatch.setattr(llm_factory.parameters, "LLM_PROVIDER", "azure", raising=False)
     monkeypatch.setattr(llm_factory.parameters, "AZURE_OPENAI_API_KEY", "test-azure-key", raising=False)
-    monkeypatch.setattr(llm_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com/", raising=False)
+    monkeypatch.setattr(llm_factory.parameters, "AZURE_OPENAI_ENDPOINT", "https://your-resource.openai.azure.com/", raising=False)
     monkeypatch.setattr(llm_factory.parameters, "AZURE_OPENAI_API_VERSION", "2024-08-01-preview", raising=False)
     monkeypatch.setattr(llm_factory.parameters, "AZURE_OPENAI_DEPLOYMENT", "gpt5-deploy", raising=False)
     monkeypatch.setattr(llm_factory.parameters, "LLM_MODEL_NAME", "gpt-5-nano", raising=False)
