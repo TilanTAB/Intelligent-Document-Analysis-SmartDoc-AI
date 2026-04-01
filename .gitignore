@@ -114,6 +114,10 @@ AGENTS.backup*.md
 .claude/
 .playwright-cli/
 
+# Personal / draft files
+LINKEDIN_POST.md
+*_POST.md
+
 # Benchmark / temp ChromaDB runs
 chroma_db_*/
 
