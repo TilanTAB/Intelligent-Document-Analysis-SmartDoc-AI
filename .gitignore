@@ -83,6 +83,7 @@ logs/
 
 # ChromaDB / Vector stores - Recreated at runtime
 chroma_db/
+vector_store/
 *.chroma
 
 # Cache - Recreated at runtime
@@ -106,3 +107,16 @@ docs/perf/benchmarks/*.json
 # Hugging Face Spaces
 .gradio/
 flagged/
+
+# Claude Code / AI agent files
+AGENTS.md
+AGENTS.backup*.md
+.claude/
+.playwright-cli/
+
+# Benchmark / temp ChromaDB runs
+chroma_db_*/
+
+# Test artifacts
+test-results/
+nul
