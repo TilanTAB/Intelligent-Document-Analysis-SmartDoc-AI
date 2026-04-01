@@ -103,6 +103,25 @@ def get_vision_client():
             azure_endpoint=parameters.AZURE_OPENAI_ENDPOINT,
         )
 
+    if provider == "bedrock":
+        try:
+            from langchain_aws import ChatBedrockConverse
+        except ImportError as e:
+            raise VisionClientUnavailable("langchain-aws is required for Bedrock vision") from e
+        logger.debug("Initializing Bedrock vision client via ChatBedrockConverse")
+        kwargs: dict = {
+            "model": parameters.BEDROCK_VISION_MODEL_ID or parameters.BEDROCK_MODEL_ID,
+            "region_name": parameters.AWS_BEDROCK_REGION,
+            "max_tokens": parameters.CHART_MAX_TOKENS,
+        }
+        if parameters.AWS_ACCESS_KEY_ID:
+            kwargs["aws_access_key_id"] = parameters.AWS_ACCESS_KEY_ID
+        if parameters.AWS_SECRET_ACCESS_KEY:
+            kwargs["aws_secret_access_key"] = parameters.AWS_SECRET_ACCESS_KEY
+        if parameters.AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = parameters.AWS_SESSION_TOKEN
+        return ChatBedrockConverse(**kwargs)
+
     raise VisionClientUnavailable(f"Unsupported VISION_PROVIDER: {provider}")
 
 
@@ -212,5 +231,17 @@ def analyze_chart_images(
             chat_kwargs["verbosity"] = "low"
         chat_response = client.chat.completions.create(**chat_kwargs)
         return _extract_chat_text(chat_response)
+
+    if current_provider == "bedrock":
+        from langchain_core.messages import HumanMessage
+        content_parts: list = [{"type": "text", "text": prompt}]
+        for path in image_paths:
+            encoded = base64.b64encode(Path(path).read_bytes()).decode("utf-8")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            })
+        response = client.invoke([HumanMessage(content=content_parts)])
+        return response.content
 
     raise VisionClientUnavailable(f"Unsupported VISION_PROVIDER: {current_provider}")

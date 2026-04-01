@@ -79,6 +79,36 @@ class Settings(BaseSettings):
         ),
     )
 
+    # AWS Bedrock
+    AWS_BEDROCK_REGION: str = Field(
+        default="us-east-1",
+        description="AWS region for Bedrock (e.g., us-east-1, us-west-2).",
+    )
+    AWS_ACCESS_KEY_ID: Optional[str] = Field(
+        default=None,
+        description="AWS access key ID. If unset, uses default boto3 credential chain (IAM role, env vars, ~/.aws/credentials).",
+    )
+    AWS_SECRET_ACCESS_KEY: Optional[str] = Field(
+        default=None,
+        description="AWS secret access key for Bedrock.",
+    )
+    AWS_SESSION_TOKEN: Optional[str] = Field(
+        default=None,
+        description="AWS session token for temporary credentials.",
+    )
+    BEDROCK_MODEL_ID: str = Field(
+        default="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        description="Bedrock model ID for LLM (default: Claude Haiku 4.5 cross-region inference).",
+    )
+    BEDROCK_EMBEDDING_MODEL_ID: str = Field(
+        default="amazon.titan-embed-text-v2:0",
+        description="Bedrock model ID for embeddings (default: Amazon Titan Text Embeddings V2).",
+    )
+    BEDROCK_VISION_MODEL_ID: Optional[str] = Field(
+        default=None,
+        description="Bedrock model ID for vision/chart analysis. If unset, falls back to BEDROCK_MODEL_ID.",
+    )
+
     # Database parameters
     CHROMA_DB_PATH: str = Field(default_factory=_default_chroma_path)
     CHROMA_COLLECTION_NAME: str = "documents"
@@ -242,7 +272,7 @@ class Settings(BaseSettings):
     @field_validator("LLM_PROVIDER")
     @classmethod
     def validate_llm_provider(cls, v: str) -> str:
-        supported = {"google", "openai", "azure"}
+        supported = {"google", "openai", "azure", "bedrock"}
         v_lower = v.lower()
         if v_lower not in supported:
             raise ValueError(f"LLM_PROVIDER must be one of {supported}")
@@ -251,7 +281,7 @@ class Settings(BaseSettings):
     @field_validator("VISION_PROVIDER")
     @classmethod
     def validate_vision_provider(cls, v: str) -> str:
-        supported = {"google", "azure", "none"}
+        supported = {"google", "azure", "bedrock", "none"}
         v_lower = v.lower()
         if v_lower not in supported:
             raise ValueError(f"VISION_PROVIDER must be one of {supported}")
@@ -260,7 +290,7 @@ class Settings(BaseSettings):
     @field_validator("EMBEDDING_PROVIDER")
     @classmethod
     def validate_embedding_provider(cls, v: str) -> str:
-        supported = {"google", "openai", "azure"}
+        supported = {"google", "openai", "azure", "bedrock"}
         v_lower = v.lower()
         if v_lower not in supported:
             raise ValueError(f"EMBEDDING_PROVIDER must be one of {supported}")
@@ -449,6 +479,15 @@ class Settings(BaseSettings):
         if provider == "google" or vision_provider == "google" or embedding_provider == "google":
             if not self.GOOGLE_API_KEY or not self.GOOGLE_API_KEY.strip() or self.GOOGLE_API_KEY.startswith("your_") or self.GOOGLE_API_KEY == "YOUR_API_KEY_HERE":
                 raise ValueError("GOOGLE_API_KEY is required when using Google provider. Set it in your .env file or HF Secrets.")
+
+        # Bedrock: soft warning only — boto3 can resolve credentials via IAM roles, env vars, or ~/.aws/credentials
+        if provider == "bedrock" or embedding_provider == "bedrock" or vision_provider == "bedrock":
+            if not _is_valid_key(self.AWS_ACCESS_KEY_ID):
+                import warnings
+                warnings.warn(
+                    "AWS_ACCESS_KEY_ID not set for Bedrock provider; "
+                    "relying on default AWS credential chain (IAM role, env vars, ~/.aws/credentials)."
+                )
 
         return self
 

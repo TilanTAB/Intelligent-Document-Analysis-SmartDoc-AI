@@ -18,6 +18,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     AzureChatOpenAI = None
 
+try:
+    from langchain_aws import ChatBedrockConverse
+except ImportError:  # pragma: no cover - optional dependency
+    ChatBedrockConverse = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,6 +217,38 @@ def get_chat_llm(
         if resolved_temperature is not None:
             kwargs["temperature"] = resolved_temperature
         return _construct_chat_model(AzureChatOpenAI, **kwargs)
+
+    if provider == "bedrock":
+        _require(
+            ChatBedrockConverse is not None,
+            "langchain-aws is required for Bedrock provider. Install with: pip install langchain-aws boto3",
+        )
+        # Agent-specific model overrides (e.g. RESEARCH_AGENT_MODEL="gpt-4o-mini") are invalid on Bedrock.
+        # Guard: if model_name doesn't look like a Bedrock model ID, fall back to BEDROCK_MODEL_ID.
+        if model_name and not model_name.startswith(("anthropic.", "us.", "eu.", "ap.", "amazon.")):
+            logger.warning(
+                "model_name=%s does not look like a Bedrock model ID; using BEDROCK_MODEL_ID=%s",
+                model_name,
+                parameters.BEDROCK_MODEL_ID,
+            )
+            model = parameters.BEDROCK_MODEL_ID
+        else:
+            model = model_name or parameters.BEDROCK_MODEL_ID
+        logger.debug("Using AWS Bedrock LLM for role=%s, model=%s", role, model)
+        kwargs: dict = {
+            "model": model,
+            "region_name": parameters.AWS_BEDROCK_REGION,
+            "temperature": temperature,
+        }
+        if resolved_max_tokens is not None:
+            kwargs["max_tokens"] = resolved_max_tokens
+        if parameters.AWS_ACCESS_KEY_ID:
+            kwargs["aws_access_key_id"] = parameters.AWS_ACCESS_KEY_ID
+        if parameters.AWS_SECRET_ACCESS_KEY:
+            kwargs["aws_secret_access_key"] = parameters.AWS_SECRET_ACCESS_KEY
+        if parameters.AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = parameters.AWS_SESSION_TOKEN
+        return ChatBedrockConverse(**kwargs)
 
     raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
 

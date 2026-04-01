@@ -10,6 +10,7 @@ from configuration.parameters import parameters
 GoogleGenerativeAIEmbeddings = None
 OpenAIEmbeddings = None
 AzureOpenAIEmbeddings = None
+BedrockEmbeddings = None
 
 try:
     # LangChain v1+ split: cache utilities moved to langchain_classic.
@@ -88,7 +89,7 @@ def _wrap_with_embedding_cache(embeddings, provider: str, model_name: str):
 
 def get_embeddings(model_name: Optional[str] = None):
     """Return an embeddings model based on configuration."""
-    global GoogleGenerativeAIEmbeddings, OpenAIEmbeddings, AzureOpenAIEmbeddings
+    global GoogleGenerativeAIEmbeddings, OpenAIEmbeddings, AzureOpenAIEmbeddings, BedrockEmbeddings
     provider = parameters.EMBEDDING_PROVIDER.lower()
     if provider == "google":
         if GoogleGenerativeAIEmbeddings is None:
@@ -154,5 +155,31 @@ def get_embeddings(model_name: Optional[str] = None):
             deployment=deployment,
         )
         return _wrap_with_embedding_cache(base, provider=provider, model_name=deployment)
+
+    if provider == "bedrock":
+        if BedrockEmbeddings is None:
+            try:
+                from langchain_aws import BedrockEmbeddings as _BedrockEmbeddings
+            except ImportError as e:
+                raise ValueError(
+                    "langchain-aws is required for Bedrock embeddings. Install with: pip install langchain-aws boto3"
+                ) from e
+            BedrockEmbeddings = _BedrockEmbeddings
+        name = model_name or parameters.BEDROCK_EMBEDDING_MODEL_ID
+        logger.debug("Using Bedrock embeddings model=%s", name)
+        creds: dict = {}
+        if parameters.AWS_ACCESS_KEY_ID:
+            creds["credentials_profile_name"] = None
+            creds["aws_access_key_id"] = parameters.AWS_ACCESS_KEY_ID
+        if parameters.AWS_SECRET_ACCESS_KEY:
+            creds["aws_secret_access_key"] = parameters.AWS_SECRET_ACCESS_KEY
+        if parameters.AWS_SESSION_TOKEN:
+            creds["aws_session_token"] = parameters.AWS_SESSION_TOKEN
+        base = BedrockEmbeddings(
+            model_id=name,
+            region_name=parameters.AWS_BEDROCK_REGION,
+            **creds,
+        )
+        return _wrap_with_embedding_cache(base, provider=provider, model_name=name)
 
     raise ValueError(f"Unsupported EMBEDDING_PROVIDER: {provider}")
