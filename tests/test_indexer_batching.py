@@ -63,3 +63,62 @@ def test_indexer_respects_configured_and_client_limited_batch_size(monkeypatch, 
     assert added_batches == [4, 4, 1]
     assert builder.last_build_profile["vector_ingest_batch_size"] == 4
     assert builder.last_build_profile["vector_ingest_batches"] == 3
+
+
+def test_trim_docs_for_indexing_is_uncapped_when_max_index_chunks_is_zero(monkeypatch):
+    monkeypatch.setattr(indexer, "get_embeddings", lambda: object())
+    monkeypatch.setattr(indexer.parameters, "MAX_INDEX_CHUNKS", 0, raising=False)
+
+    builder = indexer.RetrieverBuilder()
+    docs = [
+        Document(
+            page_content=f"content {i}",
+            metadata={"source": "s", "page": i, "chunk_id": f"c{i}", "type": "text"},
+        )
+        for i in range(5)
+    ]
+
+    trimmed = builder._trim_docs_for_indexing(docs)
+
+    assert trimmed == docs
+
+
+def test_ingest_streaming_flushes_per_batch(monkeypatch, tmp_path):
+    """Verify ingest_streaming calls add_documents once per batch_size
+    (flush-as-you-go), NOT once after draining the entire queue."""
+    import queue
+
+    created = []
+
+    def fake_chroma(*args, **kwargs):
+        store = FakeChroma(*args, **kwargs)
+        created.append(store)
+        return store
+
+    monkeypatch.setattr(indexer, "Chroma", fake_chroma)
+    monkeypatch.setattr(indexer, "get_embeddings", lambda: object())
+    monkeypatch.setattr(indexer.parameters, "CHROMA_DB_PATH", str(tmp_path / "chroma"), raising=False)
+    monkeypatch.setattr(indexer.parameters, "CHROMA_INGEST_BATCH_SIZE", 3, raising=False)
+
+    builder = indexer.RetrieverBuilder()
+
+    # Simulate a producer pushing 10 chunks then a None sentinel
+    q = queue.Queue()
+    for i in range(10):
+        q.put(Document(
+            page_content=f"streaming content {i}",
+            metadata={"source": "s", "page": i, "chunk_id": f"sc{i}", "type": "text"},
+        ))
+    q.put(None)  # sentinel
+
+    collected, vstore = builder.ingest_streaming(
+        chunk_queue=q,
+        chroma_dir=str(tmp_path / "chroma"),
+    )
+
+    assert len(collected) == 10
+    assert created, "Chroma should be instantiated"
+    # client max_batch_size=4, configured=3 → effective batch_size=3
+    # 10 chunks / 3 per batch = 3 full batches + 1 tail batch of 1
+    added_batches = created[0].added_batches
+    assert added_batches == [3, 3, 3, 1], f"Expected [3,3,3,1] but got {added_batches}"

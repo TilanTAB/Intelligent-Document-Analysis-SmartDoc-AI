@@ -166,7 +166,7 @@ All settings can be configured via environment variables or the `.env` file. Key
 - `EMBEDDING_CACHE_ENABLED`, `EMBEDDING_CACHE_DIR`, `EMBEDDING_CACHE_BATCH_SIZE`: Embedding cache controls
 - `CHUNK_SIZE`, `CHUNK_OVERLAP`: Document chunking
 - `CHUNK_SIZE_TEXT`, `CHUNK_OVERLAP_TEXT`, `CHUNK_SIZE_TABLE`, `CHUNK_OVERLAP_TABLE`, `CHUNK_SIZE_CHART`, `CHUNK_OVERLAP_CHART`: Adaptive chunking per content type
-- `MAX_INDEX_CHUNKS`: Optional hard cap on chunks indexed per build (0 disables cap)
+- `MAX_INDEX_CHUNKS`: Optional hard cap on chunks indexed per build (default `0`, which disables the cap)
 - `PRE_INGEST_DEDUPE_ENABLED`, `PRE_INGEST_COMPRESS_WHITESPACE`, `PRE_INGEST_MIN_CHUNK_CHARS`: Pre-ingest chunk optimization controls
 - `PDF_PARSE_MODE`: Backward-compatible flag (`auto|fast|fidelity` accepted), but parsing now always uses fidelity mode (`pdfplumber`)
 - `PDF_PARSE_PAGE_RANGE_WORKERS`, `PDF_PARSE_PAGE_RANGE_SIZE`: Optional page-range parallelism for large PDFs (`workers>1` enables parallel parse ranges)

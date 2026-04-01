@@ -15,6 +15,7 @@ import random
 import re
 from collections import defaultdict, deque
 import threading
+import queue   # B2: streaming chunker pipeline
 
 from content_analyzer.document_parser import DocumentProcessor
 from search_engine.indexer import RetrieverBuilder
@@ -248,11 +249,17 @@ def question_terms(question: str) -> List[str]:
 
 
 def rank_chart_chunks_by_question(question: str, chart_chunks: List) -> List:
-    """Rank chart/page chunks by lexical overlap with the user question."""
+    """Rank chart/page chunks by lexical overlap with the user question.
+
+    Sort key: (overlap_ratio, overlap_count) — ratio = matched_terms / total_terms.
+    This eliminates the previous length-bias where a longer chunk with identical
+    raw overlap always beat a shorter, more focused chunk.
+    """
     terms = question_terms(question)
     if not terms:
         return []
 
+    n_terms = len(terms)
     scored = []
     for doc in chart_chunks or []:
         metadata = getattr(doc, "metadata", {}) or {}
@@ -264,7 +271,10 @@ def rank_chart_chunks_by_question(question: str, chart_chunks: List) -> List:
         overlap = sum(1 for term in terms if term in content)
         if overlap <= 0:
             continue
-        scored.append((overlap, len(content), doc))
+        # Option C fix: sort by ratio first so a dense match beats a long chunk
+        # with the same raw count; use overlap_count as tiebreaker.
+        ratio = overlap / n_terms
+        scored.append((ratio, overlap, doc))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [doc for _, _, doc in scored]
@@ -276,21 +286,329 @@ def extract_related_chart_images(question: str, chart_chunks: List, max_items: i
     return extract_referenced_chart_images(ranked_chunks, max_items=max_items)
 
 
+def _normalize_page(raw_page):
+    """Coerce a page metadata value to a plain int, or None if not parseable.
+
+    Some loaders store page as a list ([37]), string ('37'), or int (37).
+    Using raw values as dict keys or set members blows up on lists ('unhashable
+    type: list') — this helper normalises all cases to a single int.
+    """
+    if raw_page is None:
+        return None
+    if isinstance(raw_page, list):
+        raw_page = raw_page[0] if raw_page else None
+        if raw_page is None:
+            return None
+    try:
+        return int(raw_page)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chart_chunks_for_pages(retrieved_docs: List, chart_chunks: List, question: str = "") -> List:
+    """Option A: Return chart_chunks whose page number matches any retrieved_doc's page.
+
+    This bridges the gap where text-chunks and chart-image-chunks live separately:
+    the retriever surfaces a text chunk from page 37, so we look up the chart chunk
+    that was extracted from that same page 37 and return it for display.
+
+    Ordering: chunks are returned in the order their page number first appeared in
+    retrieved_docs (i.e. most-relevant page first).
+
+    Tolerance: if no exact-page chart chunk exists, expands search to adjacent pages
+    (±1) to handle charts whose image was captured on a slightly different page
+    than the text description (common in multi-column or header-overflow layouts).
+    Adjacent-page matches are validated for content relevance: at least 1 question
+    term must appear in the chart's page_content, preventing unrelated charts from
+    being shown (e.g. 'Traffic per internet user' when the question is about 'GenAI patents').
+    """
+    # Collect ordered, deduplicated page numbers from retrieved docs.
+    # _normalize_page() handles list / string / int variants so set.add() never
+    # raises "unhashable type: list".
+    retrieved_pages: List[int] = []
+    seen_pages: set = set()
+    for doc in retrieved_docs or []:
+        raw = (getattr(doc, "metadata", {}) or {}).get("page")
+        page = _normalize_page(raw)
+        if page is not None and page not in seen_pages:
+            seen_pages.add(page)
+            retrieved_pages.append(page)
+
+    if not retrieved_pages:
+        return []
+
+    # Build page → [chart_chunk, ...] index (keys are always plain ints).
+    page_to_charts: dict = {}
+    for doc in chart_chunks or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        if not metadata.get("chart_image_path"):
+            continue
+        page = _normalize_page(metadata.get("page"))
+        if page is None:
+            continue
+        page_to_charts.setdefault(page, []).append(doc)
+
+    logger.debug(
+        "[CHART_PAGES] retrieved_pages=%s chart_pages=%s",
+        retrieved_pages[:10],
+        sorted(page_to_charts.keys())[:20],
+    )
+
+    # Pass 1: exact match — same page number
+    matched: List = []
+    seen_matched: set = set()
+    for page in retrieved_pages:
+        for chunk in page_to_charts.get(page, []):
+            cid = id(chunk)
+            if cid not in seen_matched:
+                seen_matched.add(cid)
+                matched.append(chunk)
+
+    if matched:
+        return matched
+
+    # Pass 2: adjacent-page tolerance (±1) — handles chart captured on
+    # a neighbouring page to the text that describes it.
+    # Content validation: require ≥2 question-term overlap AND ≥20% ratio
+    # to prevent generic single-term matches (e.g. "country") from showing
+    # topically unrelated charts from adjacent pages.
+    _ADJ_MIN_TERMS = 2          # absolute minimum matching terms
+    _ADJ_MIN_RATIO = 0.20       # minimum fraction of question terms matched
+    q_terms = question_terms(question) if question else []
+    for page in retrieved_pages:
+        for adj in (page - 1, page + 1):
+            for chunk in page_to_charts.get(adj, []):
+                cid = id(chunk)
+                if cid in seen_matched:
+                    continue
+                # If we have question terms, validate the chart content is related
+                if q_terms:
+                    content = str(getattr(chunk, "page_content", "") or "").lower()
+                    hits = [term for term in q_terms if term in content]
+                    overlap = len(hits)
+                    ratio = overlap / len(q_terms)
+                    if overlap < min(_ADJ_MIN_TERMS, len(q_terms)) or ratio < _ADJ_MIN_RATIO:
+                        logger.info(
+                            "[CHART_PAGES] adjacent page %d chart REJECTED "
+                            "(%d/%d terms=%.0f%%, need ≥%d and ≥%.0f%%; matched=%s)",
+                            adj, overlap, len(q_terms), ratio * 100,
+                            _ADJ_MIN_TERMS, _ADJ_MIN_RATIO * 100, hits[:5],
+                        )
+                        continue
+                    logger.info(
+                        "[CHART_PAGES] adjacent page %d chart ACCEPTED "
+                        "(%d/%d terms=%.0f%%; matched=%s)",
+                        adj, overlap, len(q_terms), ratio * 100, hits[:5],
+                    )
+                seen_matched.add(cid)
+                matched.append(chunk)
+
+    logger.info(
+        "[CHART_PAGES] exact=0 adjacent_matched=%d for retrieved_pages=%s",
+        len(matched), retrieved_pages[:10],
+    )
+    return matched
+
+
+def _chart_chunks_from_answer(answer_text: str, chart_chunks: List) -> List:
+    """Tier 0 helper: extract explicit page numbers from the LLM answer and
+    return chart_chunks that match those pages.
+
+    Why this beats page-match: the LLM often says 'page 37' in the answer even
+    when the text chunk for page 37 scores below the top-K cut-off.  Parsing the
+    answer gives us a ground-truth page number directly.
+
+    Pattern: 'page 37', 'page 37)', '(page 37', 'Page 37' — all captured.
+    Figure refs like 'Figure 1.11' are also collected and used to cross-check
+    figure titles in page_content where possible (best-effort).
+    """
+    if not answer_text:
+        return []
+
+    # Extract all bare page numbers from the answer
+    page_refs = set()
+    for m in re.finditer(r'[Pp]age\s+(\d+)', answer_text):
+        try:
+            page_refs.add(int(m.group(1)))
+        except ValueError:
+            pass
+
+    # Extract figure references (e.g. "Figure RD-1", "Figure 1.11", "Table RD-1")
+    # These will be matched against chart chunk page_content when page_refs is empty.
+    figure_refs: list = []
+    for m in re.finditer(
+        r'(?:Figure|Table|Chart|Exhibit)\s+([\w][\w.-]*\d[\w.-]*)',
+        answer_text,
+        re.IGNORECASE,
+    ):
+        figure_refs.append(m.group(0).strip())  # full match e.g. "Figure RD-1"
+
+    if not page_refs and not figure_refs:
+        return []
+
+    # Build page → chart_chunk index (normalised ints, same as _chart_chunks_for_pages)
+    page_to_charts: dict = {}
+    for doc in chart_chunks or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        if not metadata.get("chart_image_path"):
+            continue
+        page = _normalize_page(metadata.get("page"))
+        if page is None:
+            continue
+        page_to_charts.setdefault(page, []).append(doc)
+
+    logger.info(
+        "[CHART_ANSWER] answer_page_refs=%s figure_refs=%s chart_pages_available=%s",
+        sorted(page_refs),
+        figure_refs[:5],
+        sorted(page_to_charts.keys())[:20],
+    )
+
+    # Return chart chunks for exactly the pages the answer cited
+    matched: List = []
+    for page in sorted(page_refs):          # ascending page order
+        matched.extend(page_to_charts.get(page, []))
+
+    if matched:
+        return matched
+
+    # ── Figure-name matching ──────────────────────────────────────────
+    # When the answer cites "Figure RD-1" or "Table RD-1" but no bare
+    # "page N", scan chart chunk page_content for that figure name.
+    # This handles NSF/OECD-style naming where figures use alphanumeric
+    # IDs (RD-1, A-3, etc.) instead of sequential page numbers.
+    if figure_refs and not matched:
+        fig_matched: List = []
+        seen_fig: set = set()
+        # Flatten all chart chunks for content search
+        all_chart_list = [
+            chunk
+            for chunks_for_page in page_to_charts.values()
+            for chunk in chunks_for_page
+        ]
+        for fig_ref in figure_refs:
+            fig_lower = fig_ref.lower()
+            for chunk in all_chart_list:
+                cid = id(chunk)
+                if cid in seen_fig:
+                    continue
+                content = str(getattr(chunk, "page_content", "") or "").lower()
+                if fig_lower in content:
+                    seen_fig.add(cid)
+                    fig_matched.append(chunk)
+                    pg = _normalize_page((getattr(chunk, "metadata", {}) or {}).get("page"))
+                    logger.info(
+                        "[CHART_ANSWER] figure-name match: '%s' found on page %s",
+                        fig_ref, pg,
+                    )
+        if fig_matched:
+            return fig_matched
+
+    # No exact match — try adjacent pages (±1) of each answer-cited page.
+    # Validate against the ANSWER text (not just question terms) since
+    # the answer provides more specific topical context.
+    answer_terms = question_terms(answer_text)
+    _ANS_ADJ_MIN_TERMS = 3          # require ≥3 answer-terms in chart content
+    _ANS_ADJ_MIN_RATIO = 0.10       # answer text is long, so lower ratio is ok
+    seen: set = set()
+    adj_matched: List = []
+    for page in sorted(page_refs):
+        for adj in (page - 1, page + 1):
+            for chunk in page_to_charts.get(adj, []):
+                cid = id(chunk)
+                if cid in seen:
+                    continue
+                content = str(getattr(chunk, "page_content", "") or "").lower()
+                if not content:
+                    continue
+                if answer_terms:
+                    hits = [t for t in answer_terms if t in content]
+                    overlap = len(hits)
+                    ratio = overlap / len(answer_terms) if answer_terms else 0
+                    if overlap < _ANS_ADJ_MIN_TERMS or ratio < _ANS_ADJ_MIN_RATIO:
+                        logger.info(
+                            "[CHART_ANSWER] adjacent page %d REJECTED "
+                            "(%d/%d answer-terms=%.0f%%; need ≥%d and ≥%.0f%%)",
+                            adj, overlap, len(answer_terms), ratio * 100,
+                            _ANS_ADJ_MIN_TERMS, _ANS_ADJ_MIN_RATIO * 100,
+                        )
+                        continue
+                    logger.info(
+                        "[CHART_ANSWER] adjacent page %d ACCEPTED "
+                        "(%d/%d answer-terms=%.0f%%; hits=%s)",
+                        adj, overlap, len(answer_terms), ratio * 100, hits[:6],
+                    )
+                seen.add(cid)
+                adj_matched.append(chunk)
+
+    if adj_matched:
+        logger.info(
+            "[CHART_ANSWER] exact=0 adjacent_matched=%d for answer_pages=%s",
+            len(adj_matched), sorted(page_refs),
+        )
+    return adj_matched
+
+
 def build_chart_gallery_payload(
     question: str,
     retrieved_docs: List,
     chart_chunks: List,
     max_items: int = 3,
+    answer_text: str = "",
 ) -> Tuple[List[Tuple[str, str]], str, str]:
     """
-    Build gallery payload using strict evidence first, then related-chart fallback.
+    Build gallery payload using a four-tier evidence cascade:
+
+    0. Answer-guided — parse LLM answer for explicit 'page N' references → exact chart lookup
+    1. Direct        — retrieved_doc itself carries chart_image_path metadata
+    2. Top-page-match — chart_chunk shares page with the TOP-3 retrieved text chunks only
+                        (prevents showing unrelated charts from lower-ranked pages)
+    3. Lexical       — ratio-ranked term-overlap fallback across all chart_chunks
+
     Returns: (gallery_items, note_text, mode)
-    mode ∈ {'direct', 'fallback', 'none'}.
+    mode ∈ {'answer_guided', 'direct', 'page_match', 'fallback', 'none'}.
     """
+    # Tier 0: answer-guided — most precise; uses what the LLM explicitly cited
+    if answer_text:
+        answer_chunks = _chart_chunks_from_answer(answer_text, chart_chunks)
+        answer_items = extract_referenced_chart_images(answer_chunks, max_items=max_items)
+        if answer_items:
+            return answer_items, "", "answer_guided"
+        logger.info(
+            "[CHART_SELECT] tier0_answer_guided: no match (parsed_pages=%s, chart_pages=%s)",
+            sorted({_normalize_page((getattr(c, 'metadata', {}) or {}).get('page'))
+                    for c in (answer_chunks or [])} - {None}),
+            sorted({_normalize_page((getattr(c, 'metadata', {}) or {}).get('page'))
+                    for c in (chart_chunks or []) if (getattr(c, 'metadata', {}) or {}).get('chart_image_path')} - {None}),
+        )
+
+    # Tier 1: direct evidence — retrieved chunk carries its own image
     direct_items = extract_referenced_chart_images(retrieved_docs, max_items=max_items)
     if direct_items:
         return direct_items, "", "direct"
 
+    # Tier 2: page-number cross-reference restricted to TOP-3 retrieved docs only.
+    # Using all retrieved docs caused irrelevant charts (e.g. page 21, 29) to appear
+    # when the answer was about a page with no chart image (e.g. page 37).
+    # NOTE: Relies on retrieved_docs being in retrieval-relevance order.
+    # The orchestrator preserves insertion order from retriever.invoke() → AgentState.
+    top_retrieved = (retrieved_docs or [])[:3]
+    top_pages = [_normalize_page((getattr(d, 'metadata', {}) or {}).get('page')) for d in top_retrieved]
+    page_matched_chunks = _chart_chunks_for_pages(top_retrieved, chart_chunks, question=question)
+    page_match_items = extract_referenced_chart_images(page_matched_chunks, max_items=max_items)
+    if page_match_items:
+        matched_pages = [_normalize_page((getattr(c, 'metadata', {}) or {}).get('page')) for c in page_matched_chunks]
+        logger.info(
+            "[CHART_SELECT] tier2_page_match: top_retrieved_pages=%s matched_chart_pages=%s",
+            top_pages, matched_pages,
+        )
+        return page_match_items, "", "page_match"
+    logger.info(
+        "[CHART_SELECT] tier2_page_match: no match (top_retrieved_pages=%s)",
+        top_pages,
+    )
+
+    # Tier 3: lexical fallback (ratio-ranked, length-bias removed by Option C)
     fallback_items = extract_related_chart_images(question=question, chart_chunks=chart_chunks, max_items=max_items)
     if fallback_items:
         return (
@@ -1087,80 +1405,214 @@ setInterval(tick, 500);
                     seen_hashes = set()
                     chunks_by_file = []
                     total_chunks = 0
-                    for file, file_hash in file_entries:
-                        chunks = load_or_process(file, file_hash)
-                        chunks_by_file.append(chunks)
-                        total_chunks += len(chunks)
-                    if total_chunks == 0:
-                        total_chunks = 1
-                    chunk_idx = 0
-                    for chunks in chunks_by_file:
-                        for chunk in chunks:
-                            chunk_hash = processor._generate_hash(chunk.page_content.encode())
-                            if chunk_hash not in seen_hashes:
-                                seen_hashes.add(chunk_hash)
-                                all_chunks.append(chunk)
-                            # else: skip duplicate chunk
-                            chunk_idx += 1
-                            # yield progress here if needed
-                            yield (
-                                chat_history,
-                                gr.update(visible=False),
-                                gr.update(visible=False),
-                                gr.update(interactive=False),
-                                gr.update(interactive=False),
-                                gr.update(interactive=False),
-                                gr.update(interactive=False),
-                                gr.update(value=[], visible=False),
-                                gr.update(value="", visible=False),
-                                gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-  <span id="processing-msg">Processing your request...</span>
-  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
-</div>''', visible=True)
+
+                    def _spinner_yield(msg: str):
+                        """Build a 10-element Gradio yield tuple showing a spinner message."""
+                        return (
+                            chat_history,
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(value=[], visible=False),
+                            gr.update(value="", visible=False),
+                            gr.update(value=(
+                                '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
+                                '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
+                                f'<span id="processing-msg">{msg}</span>'
+                                '</div>'
+                            ), visible=True)
+                        )
+
+                    # ── B2: Streaming chunker decision ───────────────────────────────
+                    # Only activate when: kill-switch on, single file, AND cache miss.
+                    _use_streaming = (
+                        getattr(parameters, "STREAMING_CHUNKER_ENABLED", True)
+                        and len(file_entries) == 1
+                    )
+                    if _use_streaming:
+                        _sf, _sfh = file_entries[0]
+                        _cache_path_s = processor.cache_dir / f"{_sfh}.pkl"
+                        _use_streaming = not processor._is_cache_valid(_cache_path_s)
+
+                    if _use_streaming:
+                        # Producer: parse + chunk → queue
+                        # Consumer: queue → ChromaDB (running concurrently)
+                        _file, _fhash = file_entries[0]
+                        _cache_path_s = processor.cache_dir / f"{_fhash}.pkl"
+                        _chroma_dir = parameters.CHROMA_DB_PATH
+
+                        _chunk_queue = queue.Queue(maxsize=500)
+                        _thread_exc  = [None]           # cross-thread exception carrier
+                        _abort_event = threading.Event()
+                        _prod_chunks = [None]           # List[Document] returned by producer
+                        _cons_result = [None]           # (chunks, vstore) returned by consumer
+
+                        def _producer():
+                            try:
+                                _chunks_p = processor._process_file(
+                                    _file, chunk_queue=_chunk_queue
+                                )
+                                _prod_chunks[0] = _chunks_p
+                            except Exception as exc:
+                                _thread_exc[0] = exc
+                                _abort_event.set()
+                            finally:
+                                # Send emergency sentinel if producer died before its own sentinel
+                                if _abort_event.is_set():
+                                    try:
+                                        _chunk_queue.put(None, timeout=5)
+                                    except Exception:
+                                        pass
+
+                        def _consumer():
+                            try:
+                                _result = retriever_indexer.ingest_streaming(
+                                    chunk_queue=_chunk_queue,
+                                    chroma_dir=_chroma_dir,
+                                )
+                                _cons_result[0] = _result
+                            except Exception as exc:
+                                if _thread_exc[0] is None:
+                                    _thread_exc[0] = exc
+                                _abort_event.set()
+
+                        t_prod = threading.Thread(target=_producer, name="stream-producer", daemon=True)
+                        t_cons = threading.Thread(target=_consumer, name="stream-consumer", daemon=True)
+                        t_prod.start()
+                        t_cons.start()
+
+                        # Poll every 2s while threads run so Gradio doesn't see a frozen
+                        # connection — without periodic yields the browser shows a stale/error state.
+                        _stream_start = time.time()
+                        while t_prod.is_alive() or t_cons.is_alive():
+                            _elapsed = int(time.time() - _stream_start)
+                            yield _spinner_yield(f"Parsing &amp; indexing... ({_elapsed}s)")
+                            t_prod.join(timeout=2)   # wait up to 2s then loop and yield again
+
+                        t_cons.join(timeout=300)   # 5-min hard cap; prevents infinite hang
+                        if t_cons.is_alive():
+                            logger.error("[STREAMING] Consumer thread still alive after 300s — treating as failure")
+                            _thread_exc[0] = _thread_exc[0] or RuntimeError("Consumer thread timed out (300s)")
+
+                        if _thread_exc[0] is not None:
+                            logger.warning(
+                                "[STREAMING] Streaming path failed (%s: %s) — falling back to sequential",
+                                type(_thread_exc[0]).__name__, _thread_exc[0],
                             )
-                    # After all chunks, show 100%
-                    yield (
-                        chat_history,
-                        gr.update(visible=False),
-                        gr.update(visible=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(value=[], visible=False),
-                        gr.update(value="", visible=False),
-                        gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+                            _use_streaming = False  # fall through to sequential loop below
+                        else:
+                            _chunks = _prod_chunks[0]
+                            processor._save_to_cache(_chunks, _cache_path_s)
+
+                            # Dedup — mirrors sequential path lines below
+                            for chunk in _chunks:
+                                chunk_hash = processor._generate_hash(chunk.page_content.encode())
+                                if chunk_hash not in seen_hashes:
+                                    seen_hashes.add(chunk_hash)
+                                    all_chunks.append(chunk)
+
+                            _coll_chunks, _vstore = _cons_result[0]
+
+                            # Stage 3 UI update — same spinner as sequential path
+                            yield _spinner_yield("Processing your request...")
+
+                            # BM25 needs all chunks — build after both threads have joined
+                            try:
+                                retriever = retriever_indexer.build_bm25_and_ensemble(
+                                    all_chunks=all_chunks,
+                                    vector_store=_vstore,
+                                )
+                            except Exception as e:
+                                logger.warning("[STREAMING] build_bm25_and_ensemble failed: %s; falling back", e)
+                                retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
+
+                            session_state.value["retriever"] = retriever
+                            session_state.value["file_hashes"] = current_file_hashes
+                            session_state.value["chart_chunks"] = [
+                                chunk for chunk in all_chunks
+                                if (getattr(chunk, "metadata", {}) or {}).get("chart_image_path")
+                            ]
+                            session_state.value["chart_chunks_missing_logged"] = False
+
+                    if not _use_streaming:
+                        # ── Original sequential path (unchanged) ────────────────────
+                        for file, file_hash in file_entries:
+                            chunks = load_or_process(file, file_hash)
+                            chunks_by_file.append(chunks)
+                            total_chunks += len(chunks)
+                        if total_chunks == 0:
+                            total_chunks = 1
+                        chunk_idx = 0
+                        for chunks in chunks_by_file:
+                            for chunk in chunks:
+                                chunk_hash = processor._generate_hash(chunk.page_content.encode())
+                                if chunk_hash not in seen_hashes:
+                                    seen_hashes.add(chunk_hash)
+                                    all_chunks.append(chunk)
+                                # else: skip duplicate chunk
+                                chunk_idx += 1
+                                # yield progress here if needed
+                                yield (
+                                    chat_history,
+                                    gr.update(visible=False),
+                                    gr.update(visible=False),
+                                    gr.update(interactive=False),
+                                    gr.update(interactive=False),
+                                    gr.update(interactive=False),
+                                    gr.update(interactive=False),
+                                    gr.update(value=[], visible=False),
+                                    gr.update(value="", visible=False),
+                                    gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
   <span id="processing-msg">Processing your request...</span>
   <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
 </div>''', visible=True)
-                    )
-                    # Stage 3: Building Retriever
-                    yield (
-                        chat_history,
-                        gr.update(visible=False),
-                        gr.update(visible=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(interactive=False),
-                        gr.update(value=[], visible=False),
-                        gr.update(value="", visible=False),
-                        gr.update(value=(
-                            '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
-                            '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
-                            '<span id="processing-msg">Processing your request...</span>'
-                            '</div>'
-                        ), visible=True)
-                    )
-                    retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
-                    session_state.value["retriever"] = retriever
-                    session_state.value["file_hashes"] = current_file_hashes
-                    session_state.value["chart_chunks"] = [
-                        chunk
-                        for chunk in all_chunks
-                        if (getattr(chunk, "metadata", {}) or {}).get("chart_image_path")
-                    ]
-                    session_state.value["chart_chunks_missing_logged"] = False
+                                )
+                        # After all chunks, show 100%
+                        yield (
+                            chat_history,
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(value=[], visible=False),
+                            gr.update(value="", visible=False),
+                            gr.update(value='''<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+  <span id="processing-msg">Processing your request...</span>
+  <span id="processing-timer" style="opacity:0.8; margin-left:8px;"></span>
+</div>''', visible=True)
+                        )
+                        # Stage 3: Building Retriever
+                        yield (
+                            chat_history,
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(interactive=False),
+                            gr.update(value=[], visible=False),
+                            gr.update(value="", visible=False),
+                            gr.update(value=(
+                                '<div style="background:#fff; border-radius:8px; padding:18px 24px; margin-top:32px; color:#1e293b; font-size:1.2em; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; align-items:center;">'
+                                '<img src="https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif" alt="AI working" style="height:40px; margin-right:16px;">'
+                                '<span id="processing-msg">Processing your request...</span>'
+                                '</div>'
+                            ), visible=True)
+                        )
+                        retriever = retriever_indexer.build_hybrid_retriever(all_chunks)
+                        session_state.value["retriever"] = retriever
+                        session_state.value["file_hashes"] = current_file_hashes
+                        session_state.value["chart_chunks"] = [
+                            chunk
+                            for chunk in all_chunks
+                            if (getattr(chunk, "metadata", {}) or {}).get("chart_image_path")
+                        ]
+                        session_state.value["chart_chunks_missing_logged"] = False
                 # Stage 4: Generating Answer
                 yield (
                     chat_history,
@@ -1233,7 +1685,14 @@ setInterval(tick, 500);
                 )
            
                 chat_history = _append_chat_exchange(chat_history, question_text, f"**Answer:**\n{answer}")
-                retrieved_docs = retriever.invoke(question_text)
+                # Reuse documents from the workflow instead of calling
+                # retriever.invoke() again — eliminates inconsistency
+                # between the docs used for answer generation and chart selection.
+                retrieved_docs = result.get("documents") or []
+                if not retrieved_docs:
+                    # Fallback: if orchestrator didn't return docs (e.g. irrelevant question),
+                    # do a single retrieval for the chart gallery.
+                    retrieved_docs = retriever.invoke(question_text)
                 session_state.value["last_documents"] = retrieved_docs
                 chart_chunks = session_state.value.get("chart_chunks") or []
                 chart_gallery_items, chart_gallery_note_text, chart_gallery_mode = build_chart_gallery_payload(
@@ -1241,13 +1700,18 @@ setInterval(tick, 500);
                     retrieved_docs=retrieved_docs,
                     chart_chunks=chart_chunks,
                     max_items=3,
+                    answer_text=answer,          # Tier 0: answer-guided page lookup
                 )
-                direct_count = len(chart_gallery_items) if chart_gallery_mode == "direct" else 0
-                fallback_count = len(chart_gallery_items) if chart_gallery_mode == "fallback" else 0
+                answer_guided_count = len(chart_gallery_items) if chart_gallery_mode == "answer_guided" else 0
+                direct_count     = len(chart_gallery_items) if chart_gallery_mode == "direct"     else 0
+                page_match_count = len(chart_gallery_items) if chart_gallery_mode == "page_match" else 0
+                fallback_count   = len(chart_gallery_items) if chart_gallery_mode == "fallback"   else 0
                 logger.info(
-                    "[CHART_GALLERY] mode=%s direct_count=%d fallback_count=%d selected_count=%d chart_candidates=%d",
+                    "[CHART_GALLERY] mode=%s answer_guided=%d direct=%d page_match=%d fallback=%d selected=%d candidates=%d",
                     chart_gallery_mode,
+                    answer_guided_count,
                     direct_count,
+                    page_match_count,
                     fallback_count,
                     len(chart_gallery_items),
                     len(chart_chunks),

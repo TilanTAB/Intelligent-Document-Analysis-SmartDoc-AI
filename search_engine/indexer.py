@@ -446,6 +446,211 @@ class RetrieverBuilder:
 
         build_profile["vector_ingest_batch_durations_s"].extend(batch_durations)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # B2: Streaming chunker — consumer-side helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def ingest_streaming(
+        self,
+        chunk_queue: "queue.Queue",  # queue.Queue fed by _process_file(chunk_queue=...)
+        chroma_dir: str,
+    ) -> tuple:
+        """
+        B2: Consume chunks from a queue and ingest into ChromaDB as they arrive.
+
+        Runs in the consumer thread while _process_file runs in the producer thread.
+        Returns (collected_chunks, vector_store) so the caller can build BM25 +
+        EnsembleRetriever after both threads join.
+
+        Key design: batches are flushed to ChromaDB as soon as batch_size chunks
+        accumulate — this overlaps embedding API calls with the tail of parsing,
+        which is the entire point of B2.
+
+        Protocol: producer puts Document objects one by one, then puts None as sentinel.
+        """
+        import queue as _q
+
+        os.makedirs(chroma_dir, exist_ok=True)
+        manifest_path = os.path.join(chroma_dir, "indexed_manifest.json")
+
+        # Load manifest under lock — same pattern as build_hybrid_retriever
+        with _manifest_lock:
+            manifest = load_manifest(manifest_path)
+
+        vector_store = self._create_or_get_vector_store(chroma_dir)
+        batch_size = self._resolve_ingest_batch_size(vector_store)
+
+        collected_chunks: List[Document] = []  # full list returned for BM25 build
+        current_doc_ids: set = set()
+
+        accumulator: List[Document] = []       # in-flight batch waiting to reach batch_size
+        accumulator_ids: List[str] = []
+        batch_idx = 0
+        t_start = time.time()
+
+        def flush():
+            """Send accumulated batch to ChromaDB via existing retry logic.
+
+            On failure, rolls back manifest entries for the un-persisted batch
+            so a future retry doesn't skip them (manifest says 'indexed' but
+            ChromaDB never received them).
+            """
+            nonlocal batch_idx
+            if not accumulator:
+                return
+            batch_idx += 1
+            pending_ids = list(accumulator_ids)  # snapshot before clear
+            try:
+                self._add_batch_with_retry(
+                    vector_store=vector_store,
+                    batch_docs=list(accumulator),
+                    batch_ids=pending_ids,
+                    batch_idx=batch_idx,
+                )
+            except Exception:
+                # Rollback: remove manifest entries for chunks that never reached ChromaDB
+                for pid in pending_ids:
+                    manifest.pop(pid, None)
+                logger.warning(
+                    "[STREAMING] flush() failed — rolled back %d manifest entries for batch %d",
+                    len(pending_ids), batch_idx,
+                )
+                raise
+            logger.info(
+                "[STREAMING] stage=embed.batch idx=%s size=%s elapsed_s=%.1f",
+                batch_idx, len(accumulator), time.time() - t_start,
+            )
+            accumulator.clear()
+            accumulator_ids.clear()
+
+        # ── Drain queue, flushing batches as they fill ──────────────────────────
+        # Each chunk is evaluated against the manifest for idempotency and
+        # appended to the accumulator.  When the accumulator reaches batch_size
+        # we flush immediately — the embedding API call runs while the producer
+        # thread continues parsing the next pages.
+        while True:
+            try:
+                item = chunk_queue.get(timeout=120)  # 2-min safety timeout
+            except _q.Empty:
+                raise RuntimeError(
+                    "[STREAMING] Consumer timed out waiting for producer (120s) — aborting"
+                )
+
+            if item is None:   # sentinel: producer finished
+                break
+
+            chunk = item
+            collected_chunks.append(chunk)
+
+            _id = doc_id(chunk)
+            _hash = content_hash(chunk)
+            current_doc_ids.add(_id)
+
+            # Idempotent: skip chunks already in manifest with same content hash
+            # (protects against partial re-runs after a previous failure)
+            if manifest.get(_id) == _hash:
+                continue
+
+            manifest[_id] = _hash
+            accumulator.append(chunk)
+            accumulator_ids.append(_id)
+
+            if len(accumulator) >= batch_size:
+                flush()
+
+        # Flush any remaining partial batch after sentinel
+        flush()
+
+        logger.info(
+            "[STREAMING] Queue drained: chunks=%s batches=%s elapsed_s=%.1f",
+            len(collected_chunks), batch_idx, time.time() - t_start,
+        )
+
+        # ── Prune stale docs and save manifest ──────────────────────────────────
+        stale_ids = [eid for eid in list(manifest.keys()) if eid not in current_doc_ids]
+        if stale_ids:
+            try:
+                vector_store.delete(ids=stale_ids)
+                for sid in stale_ids:
+                    manifest.pop(sid, None)
+                logger.info("[STREAMING] stage=vector.prune stale_removed=%s", len(stale_ids))
+            except Exception as e:
+                logger.warning("[STREAMING] Failed to prune stale IDs: %s", e)
+
+        with _manifest_lock:
+            save_manifest(manifest_path, manifest)
+
+        logger.info(
+            "[STREAMING] Ingest complete: consumed=%s batches=%s elapsed_s=%.1f",
+            len(collected_chunks), batch_idx, time.time() - t_start,
+        )
+        return collected_chunks, vector_store
+
+    def _assemble_ensemble(
+        self,
+        docs_for_index: List[Document],
+        cache_key: str,
+        vector_store,
+    ) -> EnsembleRetriever:
+        """Shared helper: BM25 build + vector retriever wrap + EnsembleRetriever.
+
+        Both build_bm25_and_ensemble (B2 streaming) and build_hybrid_retriever
+        delegate here so the BM25/ensemble construction stays in one place.
+        """
+        # BM25 — needs all chunks at once, cannot be done incrementally
+        t_bm25_start = time.time()
+        if cache_key in self._bm25_cache:
+            bm25_retriever = self._bm25_cache[cache_key]
+            logger.debug("Reusing cached BM25 for docset %s...", cache_key[:8])
+        else:
+            texts = [doc.page_content for doc in docs_for_index]
+            metadatas = [doc.metadata for doc in docs_for_index]
+            bm25_retriever = BM25Retriever.from_texts(texts=texts, metadatas=metadatas)
+            bm25_retriever.k = parameters.BM25_SEARCH_K
+            self._bm25_cache[cache_key] = bm25_retriever
+        logger.info(
+            "[PROFILE] stage=bm25.build duration_s=%.3f docs=%s",
+            time.time() - t_bm25_start, len(docs_for_index),
+        )
+
+        # Vector retriever — wraps the already-populated store
+        vector_retriever = vector_store.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": parameters.VECTOR_SEARCH_K_CHROMA,
+                "fetch_k": parameters.VECTOR_FETCH_K,
+                "lambda_mult": 0.7,
+            },
+        )
+
+        hybrid_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, vector_retriever],
+            weights=parameters.HYBRID_RETRIEVER_WEIGHTS,
+            k=parameters.VECTOR_SEARCH_K,
+        )
+
+        self._retriever_cache[cache_key] = hybrid_retriever
+        logger.info("EnsembleRetriever built (k=%s)", parameters.VECTOR_SEARCH_K)
+        return hybrid_retriever
+
+    def build_bm25_and_ensemble(
+        self,
+        all_chunks: List[Document],
+        vector_store,
+    ) -> EnsembleRetriever:
+        """
+        B2: Build BM25 retriever + EnsembleRetriever from a complete chunk list
+        and an already-populated vector store.
+
+        Called in the main thread after both producer and consumer threads join.
+        """
+        if not all_chunks:
+            raise ValueError("No chunks provided to build_bm25_and_ensemble")
+
+        docs_for_index = self._trim_docs_for_indexing(all_chunks)
+        cache_key = self._hash_docs(docs_for_index)
+        return self._assemble_ensemble(docs_for_index, cache_key, vector_store)
+
     def build_hybrid_retriever(self, docs, session_id: str = None) -> EnsembleRetriever:
         """
         Build hybrid retriever using BM25 and vector search.
@@ -606,56 +811,14 @@ class RetrieverBuilder:
         with _manifest_lock:
             save_manifest(manifest_path, manifest)
         
-        # Create BM25 retriever
-        t_bm25_start = time.time()
-        
-        # Check BM25 cache (avoid rebuilding for same documents)
-        if cache_key in self._bm25_cache:
-            logger.debug(f"Reusing cached BM25 retriever for docset {cache_key[:8]}...")
-            bm25_retriever = self._bm25_cache[cache_key]
-        else:
-            texts = [doc.page_content for doc in docs_for_index]
-            metadatas = [doc.metadata for doc in docs_for_index]
-            bm25_retriever = BM25Retriever.from_texts(texts=texts, metadatas=metadatas)
-            bm25_retriever.k = parameters.BM25_SEARCH_K
-            self._bm25_cache[cache_key] = bm25_retriever
-            logger.debug(f"Created new BM25 retriever for docset {cache_key[:8]}...")
-        
-        t_bm25_end = time.time()
-        logger.info(f"[PROFILE] stage=bm25.build duration_s={t_bm25_end - t_bm25_start:.3f}")
-        logger.debug(f"BM25 indexed {len(docs_for_index)} texts, k={bm25_retriever.k}")
-        build_profile["bm25_build_s"] = round(t_bm25_end - t_bm25_start, 6)
-        
-        t_vec_retr_start = time.time()
-        vector_retriever = vector_store.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": parameters.VECTOR_SEARCH_K_CHROMA,
-                "fetch_k": parameters.VECTOR_FETCH_K,
-                "lambda_mult": 0.7,
-            },
-        )
-        t_vec_retr_end = time.time()
-        logger.info(f"[PROFILE] stage=vector.retriever.build duration_s={t_vec_retr_end - t_vec_retr_start:.3f}")
-        logger.debug("Vector retriever created")
-        build_profile["vector_retriever_build_s"] = round(t_vec_retr_end - t_vec_retr_start, 6)
-        
+        # BM25 + vector retriever + ensemble — delegated to shared helper
         t_ensemble_start = time.time()
-        hybrid_retriever = EnsembleRetriever(
-            retrievers=[bm25_retriever, vector_retriever],
-            weights=parameters.HYBRID_RETRIEVER_WEIGHTS,                                                                
-            k=parameters.VECTOR_SEARCH_K,
-        )
+        hybrid_retriever = self._assemble_ensemble(docs_for_index, cache_key, vector_store)
         t_ensemble_end = time.time()
-        logger.info(f"[PROFILE] stage=ensemble.build duration_s={t_ensemble_end - t_ensemble_start:.3f}")
-        logger.info(f"Hybrid retriever created (k={parameters.VECTOR_SEARCH_K})")
         logger.info(f"[PROFILE] stage=retriever.build.total duration_s={t_ensemble_end - t_vector_start:.3f}")
-        build_profile["ensemble_build_s"] = round(t_ensemble_end - t_ensemble_start, 6)
         build_profile["retriever_build_total_s"] = round(t_ensemble_end - t_vector_start, 6)
-        
-        # Cache the complete retriever for future use
-        self._retriever_cache[cache_key] = hybrid_retriever
+
         self.last_build_profile = build_profile
         logger.debug(f"Cached retriever for docset {cache_key[:8]}... (future requests will be instant)")
-        
+
         return hybrid_retriever

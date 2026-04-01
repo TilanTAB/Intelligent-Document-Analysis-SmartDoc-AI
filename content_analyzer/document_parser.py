@@ -1,20 +1,28 @@
-import pickle
+import os
+import gc
 import hashlib
-import logging
 import json
+import logging
+import pickle
 import re
-import struct  # For handling struct.error exceptions
 import shutil
+import struct  # For handling struct.error exceptions
+import concurrent.futures
+import queue as _queue_module  # B2: aliased to avoid shadowing any local 'queue' variable
+import threading as _threading   # per-page timeout guard
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+
+# Heavy third-party imports — may fail in ProcessPoolExecutor worker
+# subprocesses on Windows (spawn mode re-imports the full module tree
+# and google.genai Pydantic schema construction can cause MemoryError).
+# stdlib imports above this line are guaranteed available regardless.
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from configuration.parameters import parameters
 from configuration.definitions import MAX_TOTAL_SIZE, ALLOWED_TYPES
-import concurrent.futures
 from PIL import Image
-import gc
 from core.vision_client import (
     get_vision_client,
     analyze_chart_images,
@@ -187,6 +195,155 @@ def _table_to_markdown_impl(table: List[List], page_num: int, table_idx: int) ->
     return "\n".join(md_lines)
 
 
+# ── Per-page timeout guard ────────────────────────────────────────────
+# pdfminer (used by pdfplumber internally) can enter an infinite loop
+# in its C-level layout parser when it encounters corrupted or unusual
+# PDF page structures (e.g. malformed CMap tables, broken XObject
+# streams).  No Python exception is raised — the thread simply hangs.
+#
+# This helper runs a callable in a daemon thread with a wall-clock
+# timeout.  If the callable doesn't return in time, we raise
+# TimeoutError so the caller can skip the page and try a fallback.
+#
+# The daemon thread may leak if the C code never returns, but that is
+# acceptable — the process will reclaim it on exit, and the alternative
+# (hanging the entire app for hours) is far worse.
+_PAGE_OP_TIMEOUT_S = int(os.environ.get("PDF_PAGE_OP_TIMEOUT_S", "60"))
+
+
+def _run_with_timeout(func, timeout_s: int = _PAGE_OP_TIMEOUT_S):
+    """Run *func()* in a daemon thread; raise TimeoutError if it hangs.
+
+    Returns the function's return value on success.
+    Re-raises any exception the function raised.
+    """
+    result_box: list = [None]
+    error_box: list = [None]
+
+    def _worker():
+        try:
+            result_box[0] = func()
+        except Exception as exc:
+            error_box[0] = exc
+
+    t = _threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+
+    if t.is_alive():
+        # Thread leaked — monitor accumulation so repeated hangs
+        # are visible in logs before they degrade the entire app.
+        active = _threading.active_count()
+        logger.warning(
+            "[THREAD_LEAK] Daemon thread abandoned after %ds timeout. "
+            "Active threads now: %d (>20 indicates progressive leak)",
+            timeout_s,
+            active,
+        )
+        raise TimeoutError(
+            f"Operation did not complete within {timeout_s}s "
+            f"(likely pdfminer C-level hang)"
+        )
+    if error_box[0] is not None:
+        raise error_box[0]
+    return result_box[0]
+
+
+_page_offset_cache: dict = {}  # {file_content_hash: offset} — keyed on content, not path
+
+def detect_page_label_offset(file_path: str, file_hash: str = "") -> int:
+    """Detect the front-matter page offset for a PDF.
+
+    Many reports/books have unnumbered or Roman-numeral front matter
+    (cover, copyright, TOC, abbreviations) before Arabic page "1" starts.
+    PDF parsers count ALL physical pages sequentially, so printed page 12
+    may be raw page 35 (offset = 23).
+
+    This function uses pypdf's page_labels (derived from the PDF /PageLabels
+    entry) to find where Arabic numbering begins.  If the PDF has no labels,
+    it falls back to a heuristic: scan the first ~60 pages' extracted text
+    for a standalone "1" at the bottom (common footer page number).
+
+    Args:
+        file_path: Path to the PDF file.
+        file_hash: Optional content-based hash for caching.  When provided,
+                   results are cached by hash (safe across Gradio temp renames).
+                   When empty, no caching is applied.
+
+    Returns:
+        int: The number of front-matter pages before printed page 1.
+             Raw page index (1-based) minus offset = printed page number.
+             Returns 0 if no offset is detected or pypdf is unavailable.
+    """
+    # Cache lookup by content hash (not path) — safe across Gradio temp renames
+    if file_hash and file_hash in _page_offset_cache:
+        return _page_offset_cache[file_hash]
+    def _detect() -> int:
+        """Inner detection logic — returns offset or 0."""
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            logger.debug("[PAGE_OFFSET] pypdf not available — offset=0")
+            return 0
+
+        try:
+            reader = PdfReader(file_path)
+        except Exception as e:
+            logger.debug("[PAGE_OFFSET] Failed to open PDF with pypdf: %s — offset=0", e)
+            return 0
+
+        # ── Strategy 1: PDF /PageLabels (most reliable) ──────────────────
+        try:
+            labels = reader.page_labels
+            if labels:
+                for raw_idx, label in enumerate(labels):
+                    label_stripped = str(label).strip()
+                    if label_stripped == "1":
+                        offset = raw_idx  # raw_idx is 0-based
+                        if offset > 0:
+                            logger.info(
+                                "[PAGE_OFFSET] Detected offset=%d from PDF page labels "
+                                "(physical page %d has label '1') file=%s",
+                                offset, raw_idx + 1, Path(file_path).name,
+                            )
+                            return offset
+        except Exception as e:
+            logger.debug("[PAGE_OFFSET] page_labels extraction failed: %s", e)
+
+        # ── Strategy 2: Heuristic — scan footer text for page "1" ────────
+        try:
+            scan_limit = min(len(reader.pages), 60)
+            for raw_idx in range(scan_limit):
+                try:
+                    text = (reader.pages[raw_idx].extract_text() or "").strip()
+                    if not text:
+                        continue
+                    lines = text.splitlines()
+                    if lines:
+                        last_line = lines[-1].strip()
+                        if re.match(r'^[-–—\s]*1[-–—\s]*$', last_line) or last_line == "1":
+                            offset = raw_idx
+                            if offset > 0:
+                                logger.info(
+                                    "[PAGE_OFFSET] Detected offset=%d from footer heuristic "
+                                    "(physical page %d has footer '1') file=%s",
+                                    offset, raw_idx + 1, Path(file_path).name,
+                                )
+                                return offset
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("[PAGE_OFFSET] Footer heuristic failed: %s", e)
+
+        logger.debug("[PAGE_OFFSET] No offset detected for %s — offset=0", Path(file_path).name)
+        return 0
+
+    result = _detect()
+    if file_hash:
+        _page_offset_cache[file_hash] = result
+    return result
+
+
 def extract_pdf_page_range_payload(
     args: Tuple[str, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -243,36 +400,68 @@ def extract_pdf_page_range_payload(
                 return True
 
             try:
-                for params in (
-                    default_parameters,
-                    text_parameters,
-                    hybrid_parameters,
-                ):
+                # Per-page timeout guard: pdfminer C-level layout
+                # parser can hang forever on corrupted pages.
+                def _worker_extract_page():
+                    _tables = []
+                    for params in (
+                        default_parameters,
+                        text_parameters,
+                        hybrid_parameters,
+                    ):
+                        try:
+                            extracted = page.extract_tables(params) if params else page.extract_tables()
+                            if extracted:
+                                for table in extracted:
+                                    if table and len(table) >= 2:
+                                        _tables.append(table)
+                        except (struct.error, Exception):
+                            continue
+
                     try:
-                        extracted = page.extract_tables(params) if params else page.extract_tables()
-                        if extracted:
-                            for table in extracted:
-                                add_table_if_unique(table)
-                    except struct.error:
-                        continue
+                        found_tables = page.find_tables(text_parameters)
+                        if found_tables:
+                            for ft in found_tables:
+                                table = ft.extract()
+                                if table and len(table) >= 2:
+                                    _tables.append(table)
+                    except (struct.error, Exception):
+                        pass
+
+                    _text = ""
+                    try:
+                        _text = page.extract_text() or ""
                     except Exception:
-                        continue
+                        _text = ""
+                    return _tables, _text
 
                 try:
-                    found_tables = page.find_tables(text_parameters)
-                    if found_tables:
-                        for ft in found_tables:
-                            table = ft.extract()
-                            add_table_if_unique(table)
-                except struct.error:
-                    pass
-                except Exception:
-                    pass
+                    raw_tables, text = _run_with_timeout(
+                        _worker_extract_page,
+                        timeout_s=_PAGE_OP_TIMEOUT_S,
+                    )
+                    for t in raw_tables:
+                        add_table_if_unique(t)
+                except TimeoutError:
+                    # Page hung — try pypdf text fallback
+                    text = ""
+                    fallback_reader = _maybe_get_pypdf_reader()
+                    if fallback_reader is not None and page_idx < len(fallback_reader.pages):
+                        try:
+                            text = fallback_reader.pages[page_idx].extract_text() or ""
+                            if text.strip():
+                                text_fallback_success += 1
+                            else:
+                                text_fallback_fail += 1
+                                text = ""
+                        except Exception:
+                            text_fallback_fail += 1
+                            text = ""
+                    else:
+                        text_fallback_fail += 1
 
-                text = ""
-                try:
-                    text = page.extract_text() or ""
-                except Exception:
+                if not text.strip():
+                    # pdfplumber returned empty — try pypdf fallback
                     fallback_reader = _maybe_get_pypdf_reader()
                     if fallback_reader is not None and page_idx < len(fallback_reader.pages):
                         try:
@@ -552,7 +741,7 @@ class DocumentProcessor:
     OpenCV detection and provider-based vision analysis with parallelization for speed.
     """
     # Cache metadata version - increment when cache format changes
-    CACHE_VERSION = 6  # Incremented for persisted chart assets robustness + dead temp-path cache invalidation
+    CACHE_VERSION = 7  # page label offset: stored page numbers now match printed page numbers
 
     def __init__(self):
         """Initialize the document processor with cache directory and splitter configuration."""
@@ -1001,6 +1190,15 @@ class DocumentProcessor:
                         curve_count >= 25
                         or (curve_count >= 10 and line_count >= 20)
                         or ((line_count + curve_count) >= 220 and char_count <= 1400)
+                        # Small vector charts (e.g. Figure 1.11 in EnergyandAI.pdf p37):
+                        # only ~5 curves for data series + ~13 lines for axes/grid.
+                        # Require both curves AND lines to avoid flagging text-only pages.
+                        or (curve_count >= 5 and line_count >= 8)
+                        # Bar charts rendered as pure rectangles (no curves/images):
+                        # e.g. FIGURE 1.2 in Digital Progress Report — 116 rects, 0 curves.
+                        # Require high rect count with moderate text — a page dominated
+                        # by bars but with axis labels and title text nearby.
+                        or (rect_count >= 50 and char_count <= 2900 and line_count < 100)
                     )
                     raster_chart_like = image_count >= 1 and char_count <= 1200
 
@@ -1043,6 +1241,7 @@ class DocumentProcessor:
         file,
         pdf_analysis_mode: Optional[str] = None,
         chart_detection_backend: Optional[str] = None,
+        chunk_queue: Optional["_queue_module.Queue"] = None,  # B2: streaming queue; None = disabled
     ) -> List[Document]:
         file_ext = Path(file.name).suffix.lower()
         if file_ext not in ALLOWED_TYPES:
@@ -1219,6 +1418,17 @@ class DocumentProcessor:
                         metadata=chunk_metadata
                     )
                     all_chunks.append(chunk_doc)
+                    if chunk_queue is not None:          # B2: forward chunk to consumer thread
+                        try:
+                            chunk_queue.put(chunk_doc, timeout=5)
+                        except _queue_module.Full:
+                            # Consumer thread must have died; abort streaming gracefully
+                            logger.warning("[STREAMING] Producer queue full — consumer may be dead; aborting")
+                            try:
+                                chunk_queue.put(None, timeout=1)   # emergency sentinel
+                            except Exception:
+                                pass
+                            raise RuntimeError("Streaming queue full: consumer thread is not draining")
             t_chunk_end = datetime.now().timestamp()
             logger.info(f"[PROFILE] stage=chunking.total duration_s={t_chunk_end - t_chunk_start:.3f} chunks={len(all_chunks)}")
             if dropped_tiny or dropped_dupes:
@@ -1230,6 +1440,8 @@ class DocumentProcessor:
                 )
                  
             logger.info(f"Processed {file.name}: {len(documents)} page(s) → {len(all_chunks)} chunk(s)")
+            if chunk_queue is not None:          # B2: signal consumer that all chunks are sent
+                chunk_queue.put(None)
             return all_chunks
         except ImportError as e:
             logger.error(f"Required loader not installed for {file_ext}: {e}")
@@ -1259,6 +1471,9 @@ class DocumentProcessor:
         file_bytes = Path(file_path).read_bytes()
         file_hash = self._generate_hash(file_bytes)
         stable_source = f"{Path(file_path).name}::{file_hash}"
+        # Detect front-matter page offset (same as text parser) so chart
+        # page numbers match the printed numbers in the PDF.
+        chart_page_offset = detect_page_label_offset(file_path, file_hash=file_hash)
         def deduplicate_charts_by_title(chart_chunks):
             seen_titles = set()
             unique_chunks = []
@@ -1560,23 +1775,13 @@ class DocumentProcessor:
                             continue
 
                         results = []
-                        if process_pool_available:
-                            try:
-                                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                                    results = list(executor.map(detect_chart_on_page_path, page_image_tuples))
-                            except Exception as e:
-                                process_pool_available = False
-                                logger.warning(
-                                    "ProcessPool chart detection failed on pages %s-%s (%s). "
-                                    "Switching to ThreadPool fallback for remaining batches.",
-                                    batch_start,
-                                    batch_end,
-                                    e,
-                                )
-
-                        if not results:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                                results = list(executor.map(detect_chart_on_page_path, page_image_tuples))
+                        # Use ThreadPool directly — ProcessPool on Windows
+                        # causes MemoryError due to google.genai Pydantic
+                        # schema construction in spawned worker subprocesses.
+                        # detect_chart_on_page_path is I/O+OpenCV bound and
+                        # releases the GIL during C-level work.
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            results = list(executor.map(detect_chart_on_page_path, page_image_tuples))
 
                         for page_num, page_image_path, detection_result in results:
                             _store_detected_chart(
@@ -1743,6 +1948,31 @@ class DocumentProcessor:
                 # After chart_documents is created (batch or sequential), deduplicate by title:
                 chart_documents = deduplicate_charts_by_title(chart_documents)
 
+                # ── Apply front-matter page offset to chart documents ──────
+                # Internally, chart detection uses raw PDF page indices.
+                # Adjust to printed page numbers so they align with text chunks.
+                if chart_page_offset:
+                    for cdoc in chart_documents:
+                        raw_pg = cdoc.metadata.get("page")
+                        if raw_pg is None:
+                            continue
+                        # Coerce to int safely — raw_pg may be int, str, or list
+                        try:
+                            raw_pg_int = int(raw_pg[0] if isinstance(raw_pg, list) else raw_pg)
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        printed_pg = max(1, raw_pg_int - chart_page_offset)
+                        # Replace in page_content BEFORE updating metadata so the
+                        # f-string matches the original raw value in the text.
+                        cdoc.page_content = cdoc.page_content.replace(
+                            f"(Page {raw_pg_int})", f"(Page {printed_pg})", 1
+                        )
+                        cdoc.metadata["page"] = printed_pg
+                    logger.info(
+                        "[PAGE_OFFSET] Applied offset=%d to %d chart documents",
+                        chart_page_offset, len(chart_documents),
+                    )
+
                 phase2_duration = datetime.now().timestamp() - phase2_start
                 latency_monitor.record(
                     stage="chart.phase2",
@@ -1781,6 +2011,11 @@ class DocumentProcessor:
         logger.info(f"[PDFPLUMBER] Processing: {file_path}")
         file_hash = self._generate_file_hash(file_path)
         stable_source = f"{Path(file_path).name}::{file_hash}"
+
+        # Detect front-matter page offset so stored page numbers match
+        # the printed page numbers in the PDF (e.g. offset=23 means
+        # raw page 35 → printed page 12).
+        page_offset = detect_page_label_offset(file_path, file_hash=file_hash)
         
         # Strategy 1: Line-based (default) - for tables with visible borders
         default_parameters = {}
@@ -1842,13 +2077,70 @@ class DocumentProcessor:
                     ]
 
                     range_payloads: List[Dict[str, Any]] = []
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=parse_workers) as executor:
+                    # ── Timeout-safe ThreadPoolExecutor ────────────────
+                    # Why ThreadPool instead of ProcessPool:
+                    #   On Windows, ProcessPoolExecutor uses 'spawn' which
+                    #   re-imports the ENTIRE module tree in each worker
+                    #   subprocess.  The google.genai.types module has
+                    #   ~14k lines of Pydantic models whose schema
+                    #   construction causes MemoryError, silently killing
+                    #   the worker and hanging the parent process.
+                    #   ThreadPool avoids this entirely. pdfplumber is
+                    #   I/O-bound and pdfminer releases the GIL during
+                    #   C-level work, so threads are appropriate here.
+                    #
+                    # Why manual lifecycle instead of `with` block:
+                    #   The context manager calls shutdown(wait=True) on
+                    #   exit, which blocks forever if a worker thread
+                    #   hangs in pdfminer's C-level layout parser.
+                    #   Manual shutdown(wait=False, cancel_futures=True)
+                    #   lets us abandon stuck workers and fall through to
+                    #   the sequential fallback path.
+                    _PPE_TIMEOUT_S = int(os.environ.get("PDF_PARSE_RANGE_TIMEOUT_S", "300"))
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=parse_workers)
+                    try:
                         futures = [
                             executor.submit(extract_pdf_page_range_payload, payload)
                             for payload in worker_inputs
                         ]
-                        for future in concurrent.futures.as_completed(futures):
-                            range_payloads.append(future.result())
+
+                        # Wait for ALL workers, but cap total wall-clock.
+                        # If any worker is stuck in pdfminer C code, no
+                        # Python exception is raised — only the timeout
+                        # can rescue us.
+                        done, not_done = concurrent.futures.wait(
+                            futures,
+                            timeout=_PPE_TIMEOUT_S,
+                            return_when=concurrent.futures.ALL_COMPLETED,
+                        )
+
+                        # Collect results from workers that finished.
+                        for future in done:
+                            try:
+                                range_payloads.append(future.result(timeout=0))
+                            except Exception as worker_err:
+                                logger.warning(
+                                    "[PDFPLUMBER] Page-range worker error: %s", worker_err
+                                )
+
+                        # If any workers are still stuck, log and raise so
+                        # the outer except triggers the sequential fallback.
+                        if not_done:
+                            logger.error(
+                                "[PDFPLUMBER] %d/%d page-range worker(s) timed out after %ds",
+                                len(not_done), len(futures), _PPE_TIMEOUT_S,
+                            )
+                            for f in not_done:
+                                f.cancel()  # no-op for running tasks, but marks pending ones
+                            raise TimeoutError(
+                                f"{len(not_done)} page-range worker(s) hung — "
+                                f"falling back to sequential parser"
+                            )
+                    finally:
+                        # shutdown(wait=False) returns immediately even if
+                        # workers are stuck; cancel_futures=True (Python 3.9+)
+                        # prevents queued-but-not-started tasks from running.
+                        executor.shutdown(wait=False, cancel_futures=True)
 
                     pages_payload: List[Dict[str, Any]] = []
                     text_fallback_success = 0
@@ -1862,9 +2154,11 @@ class DocumentProcessor:
                     all_content: List[Document] = []
                     total_tables = 0
                     for page_payload in pages_payload:
-                        page_num = int(page_payload.get("page_num", 0) or 0)
-                        if page_num < 1:
+                        raw_page = int(page_payload.get("page_num", 0) or 0)
+                        if raw_page < 1:
                             continue
+                        # Apply front-matter offset: raw page 35 → printed page 12
+                        page_num = max(1, raw_page - page_offset) if page_offset else raw_page
                         page_content = [f"## Page {page_num}"]
                         for table in page_payload.get("tables", []) or []:
                             total_tables += 1
@@ -1942,7 +2236,9 @@ class DocumentProcessor:
 
         with pdfplumber.open(file_path) as pdf:
             total_pages = len(pdf.pages)
-            for page_num, page in enumerate(pdf.pages, 1):
+            for raw_page, page in enumerate(pdf.pages, 1):
+                # Apply front-matter offset: raw page 35 → printed page 12
+                page_num = max(1, raw_page - page_offset) if page_offset else raw_page
                 page_content = [f"## Page {page_num}"]
                 page_tables = []
                 table_hashes = set()  # Track unique tables
@@ -1961,121 +2257,150 @@ class DocumentProcessor:
                     return False
                 
                 # --- Robust per-page error handling ---
+                # Wrap ALL pdfplumber operations for this page in a
+                # timeout guard.  pdfminer's C-level layout parser can
+                # enter an infinite loop on corrupted pages — no Python
+                # exception is raised, the thread simply never returns.
+                # _run_with_timeout() spawns a daemon thread and raises
+                # TimeoutError if it doesn't finish in _PAGE_OP_TIMEOUT_S.
+                _page_timed_out = False
                 try:
-                    # Strategy 1: Default line-based detection
-                    try:
-                        default_tables = page.extract_tables()
-                        if default_tables:
-                            for t in default_tables:
-                                add_table_if_unique(t, "default")
-                    except struct.error as e:
-                        # Common with malformed PDFs - not critical, other strategies will retry
-                        logger.debug(f"PDF structure issue on page {page_num}: {e} (continuing with alternative methods)")
-                    except Exception as e:
-                        logger.debug(f"Default table extraction skipped on page {page_num}: {type(e).__name__}")
-                    
-                    # Strategy 2: Text-based detection for borderless tables
-                    try:
-                        text_tables = page.extract_tables(text_parameters)
-                        if text_tables:
-                            for t in text_tables:
-                                add_table_if_unique(t, "text")
-                    except struct.error as e:
-                        logger.debug(f"Text strategy skipped on page {page_num} due to PDF structure")
-                    except Exception as e:
-                        logger.debug(f"Text strategy failed on page {page_num}: {type(e).__name__}")
-                    
-                    # Strategy 3: Hybrid detection
-                    try:
-                        hybrid_tables = page.extract_tables(hybrid_parameters)
-                        if hybrid_tables:
-                            for t in hybrid_tables:
-                                add_table_if_unique(t, "hybrid")
-                    except struct.error as e:
-                        logger.debug(f"Hybrid strategy skipped on page {page_num} due to PDF structure")
-                    except Exception as e:
-                        logger.debug(f"Hybrid strategy failed on page {page_num}: {type(e).__name__}")
-                    
-                    # Strategy 4: Use find_tables() for more control
-                    try:
-                        found_tables = page.find_tables(text_parameters)
-                        if found_tables:
-                            for ft in found_tables:
-                                t = ft.extract()
-                                add_table_if_unique(t, "find_tables")
-                    except struct.error as e:
-                        logger.debug(f"find_tables() skipped on page {page_num} due to PDF structure")
-                    except Exception as e:
-                        logger.debug(f"find_tables() failed on page {page_num}: {type(e).__name__}")
-                
-                    # Convert tables to markdown
+                    def _extract_page_tables_and_text():
+                        """All pdfplumber work for one page — runs inside timeout guard."""
+                        _tables: List[Tuple] = []
+                        _text = ""
+
+                        # Strategy 1: Default line-based detection
+                        try:
+                            default_tables = page.extract_tables()
+                            if default_tables:
+                                for t in default_tables:
+                                    if t and len(t) >= 2:
+                                        _tables.append((t, "default"))
+                        except (struct.error, Exception):
+                            pass
+
+                        # Strategy 2: Text-based detection for borderless tables
+                        try:
+                            text_tables = page.extract_tables(text_parameters)
+                            if text_tables:
+                                for t in text_tables:
+                                    if t and len(t) >= 2:
+                                        _tables.append((t, "text"))
+                        except (struct.error, Exception):
+                            pass
+
+                        # Strategy 3: Hybrid detection
+                        try:
+                            hybrid_tables = page.extract_tables(hybrid_parameters)
+                            if hybrid_tables:
+                                for t in hybrid_tables:
+                                    if t and len(t) >= 2:
+                                        _tables.append((t, "hybrid"))
+                        except (struct.error, Exception):
+                            pass
+
+                        # Strategy 4: find_tables() for more control
+                        try:
+                            found_tables = page.find_tables(text_parameters)
+                            if found_tables:
+                                for ft in found_tables:
+                                    t = ft.extract()
+                                    if t and len(t) >= 2:
+                                        _tables.append((t, "find_tables"))
+                        except (struct.error, Exception):
+                            pass
+
+                        # Text extraction
+                        try:
+                            _text = page.extract_text() or ""
+                        except Exception:
+                            _text = ""   # caller will attempt pypdf fallback
+
+                        return _tables, _text
+
+                    raw_tables, text = _run_with_timeout(
+                        _extract_page_tables_and_text,
+                        timeout_s=_PAGE_OP_TIMEOUT_S,
+                    )
+
+                    # Deduplicate tables
+                    for table, strategy in raw_tables:
+                        add_table_if_unique(table, strategy)
+
+                except TimeoutError:
+                    # pdfminer hung on this page — skip pdfplumber entirely
+                    # and attempt pypdf text fallback below.
+                    _page_timed_out = True
+                    text = ""
+                    logger.warning(
+                        "[PDFPLUMBER] Page %s timed out after %ds (likely pdfminer C-level hang) — using pypdf fallback",
+                        page_num, _PAGE_OP_TIMEOUT_S,
+                    )
+
+                # If pdfplumber failed to extract text (empty string from
+                # exception OR from timeout), try pypdf as fallback.
+                if not text.strip():
+                    primary_reason = "timeout" if _page_timed_out else "extraction_empty_or_failed"
+                    fallback_reader = get_pypdf_reader()
+                    if fallback_reader is not None and (raw_page - 1) < len(fallback_reader.pages):
+                        try:
+                            fallback_text = fallback_reader.pages[raw_page - 1].extract_text() or ""
+                            if fallback_text.strip():
+                                text = fallback_text
+                                text_fallback_success += 1
+                                logger.debug(
+                                    "[PDFPLUMBER] Text fallback used on page %s (%s)",
+                                    page_num,
+                                    primary_reason,
+                                )
+                            else:
+                                text_fallback_fail += 1
+                        except Exception as fallback_err:
+                            text_fallback_fail += 1
+                            logger.warning(
+                                "Text extraction failed on page %s: %s; pypdf fallback failed: %s",
+                                page_num,
+                                primary_reason,
+                                fallback_err,
+                            )
+                    elif _page_timed_out:
+                        text_fallback_fail += 1
+
+                # Convert tables to markdown, assemble page Document.
+                # Outer safety net: if anything unexpected blows up
+                # (e.g. bad table data, encoding error), skip the page
+                # instead of crashing the entire parse run.
+                try:
                     for table, strategy in page_tables:
                         total_tables += 1
                         md_table = self._table_to_markdown(table, page_num, total_tables)
                         if md_table:
                             page_content.append(md_table)
-                
-                    # Extract text
-                    text = ""
-                    try:
-                        text = page.extract_text() or ""
-                    except Exception as e:
-                        primary_reason = f"{type(e).__name__}: {e}"
-                        fallback_reader = get_pypdf_reader()
-                        if fallback_reader is not None and (page_num - 1) < len(fallback_reader.pages):
-                            try:
-                                fallback_text = fallback_reader.pages[page_num - 1].extract_text() or ""
-                                if fallback_text.strip():
-                                    text = fallback_text
-                                    text_fallback_success += 1
-                                    logger.debug(
-                                        "[PDFPLUMBER] Text fallback used on page %s (%s)",
-                                        page_num,
-                                        primary_reason,
-                                    )
-                                else:
-                                    text_fallback_fail += 1
-                                    logger.warning(
-                                        "Text extraction failed on page %s: %s; pypdf fallback returned empty text",
-                                        page_num,
-                                        primary_reason,
-                                    )
-                            except Exception as fallback_err:
-                                text_fallback_fail += 1
-                                logger.warning(
-                                    "Text extraction failed on page %s: %s; pypdf fallback failed: %s",
-                                    page_num,
-                                    primary_reason,
-                                    fallback_err,
-                                )
-                        else:
-                            text_fallback_fail += 1
-                            logger.warning(
-                                "Text extraction failed on page %s: %s",
-                                page_num,
-                                primary_reason,
-                            )
 
                     if text:
                         page_content.append(text.strip())
-                    
+
                     if len(page_content) > 1:
                         combined = "\n\n".join(page_content)
                         chunk_id = f"txt_{file_hash}_{page_num}_0"
                         doc = Document(
                             page_content=combined,
                             metadata={
-                                "source": stable_source,                                
+                                "source": stable_source,
                                 "page": page_num,
                                 "loader": "pdfplumber",
                                 "tables_count": total_tables,
                                 "type": "text",
-                                "chunk_id": chunk_id
-                            }
+                                "chunk_id": chunk_id,
+                            },
                         )
                         all_content.append(doc)
-                except Exception as e:
-                    logger.warning(f"Skipping page {page_num} due to error: {e}")
+                except Exception as page_err:
+                    logger.warning(
+                        "[PDFPLUMBER] Skipping page %s due to error: %s",
+                        page_num, page_err,
+                    )
                     continue
         
         t_end = datetime.now().timestamp()

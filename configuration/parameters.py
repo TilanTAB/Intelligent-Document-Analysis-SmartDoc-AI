@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     CHROMA_HNSW_BATCH_SIZE: int = 100
     CHROMA_HNSW_SYNC_THRESHOLD: int = 1000
     VECTOR_INGEST_PARALLEL_WORKERS: int = 1
+    STREAMING_CHUNKER_ENABLED: bool = True  # B2: overlap parse + vector ingest; set False to disable
 
     # Chunking parameters
     CHUNK_SIZE: int = 2000
@@ -100,7 +101,7 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP_TABLE: int = 80
     CHUNK_SIZE_CHART: int = 2600
     CHUNK_OVERLAP_CHART: int = 120
-    MAX_INDEX_CHUNKS: int = 2000
+    MAX_INDEX_CHUNKS: int = 0
     PRE_INGEST_DEDUPE_ENABLED: bool = True
     PRE_INGEST_COMPRESS_WHITESPACE: bool = True
     PRE_INGEST_MIN_CHUNK_CHARS: int = 40

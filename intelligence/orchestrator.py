@@ -142,6 +142,10 @@ class AgentWorkflow:
         }
 
     def _combine_answers(self, state: AgentState) -> Dict[str, Any]:
+        # NOTE: intentionally does NOT return "documents" — each sub-worker used
+        # a different document set, so there's no single authoritative list.
+        # LangGraph preserves the last sub-worker's documents in state, which is
+        # imprecise but acceptable for chart selection on multi-question queries.
         sub_results = sorted(state.get("sub_results", []), key=lambda r: r["idx"])
         combined = "\n\n".join(
             f"Q{i+1}: {r['question']}\nA: {r['answer']}"
@@ -168,6 +172,7 @@ class AgentWorkflow:
             return {
                 "draft_answer": out.get("draft_answer", ""),
                 "verification_report": out.get("verification_report", ""),
+                "documents": out.get("documents", []),
             }
         g.add_node("run_single", run_single)
         g.set_entry_point("detect_query_type")
@@ -261,6 +266,7 @@ Question: {state['question']}
         return {
             "draft_answer": final.get("draft_answer", ""),
             "verification_report": final.get("verification_report", ""),
+            "documents": final.get("documents", []),
         }
 
     def _verification_step(self, state: AgentState) -> Dict[str, Any]:
